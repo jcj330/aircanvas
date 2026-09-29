@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>空中画板 · Air Canvas</title>
+<!--
+  ============================================================
+  空中画板 AirCanvas —— 基于摄像头手部追踪的隔空绘画网页
+  课程程序设计实验
+
+  技术栈：HTML5 + CSS3 + 原生 JavaScript + MediaPipe Hands
+  运行方式：Chrome / Edge 双击打开本文件即可
+
+  文件内部模块划分（便于查阅实现过程）：
+    模块 1  UI 结构与样式（HTML + CSS）
+    模块 2  全局配置 CONFIG
+    模块 3  CDN 多源容错加载器
+    模块 4  摄像头管理器
+    模块 5  手势识别器（21 关键点归一化判定 + 稳定器）
+    模块 6  状态机（绘制 / 暂停 / 橡皮擦 / 停止 / 待机）
+    模块 7  One Euro 自适应滤波器 + 贝塞尔平滑
+    模块 8  绘图引擎（落笔 / 笔画 / 橡皮擦）
+    模块 9  撤销 / 重做（ImageData 快照栈）
+    模块 10 工具栏与交互 UI
+    模块 11 PNG 导出
+    模块 12 主流程编排
+  ============================================================
+-->
+<style>
+/* ================= 模块 1：全局样式 ================= */
+:root{
+  --bg:#0b1120; --panel:rgba(17,24,42,.82); --line:rgba(148,163,184,.14);
+  --text:#e2e8f0; --muted:#8794ad;
+  --accent:#6366f1; --accent2:#a855f7;
+  --ok:#22c55e; --warn:#f59e0b; --danger:#ef4444; --idle:#64748b; --stop:#818cf8;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  background:radial-gradient(1100px 600px at 75% -10%,#1b2547 0%,var(--bg) 55%) fixed;
+  color:var(--text);display:flex;flex-direction:column;align-items:center;
+  min-height:100vh;user-select:none;overflow-x:hidden;
+}
+
+/* ---------- 顶部状态栏 ---------- */
+#topbar{
+  width:min(94vw,880px);display:flex;align-items:center;justify-content:space-between;
+  padding:14px 4px 10px;
+}
+.logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700;letter-spacing:1px}
+.logo .dot{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 12px var(--accent)}
+.logo small{color:var(--muted);font-weight:400;font-size:12px}
+.top-right{display:flex;align-items:center;gap:10px}
+#fps{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;background:var(--panel);border:1px solid var(--line);padding:4px 10px;border-radius:20px}
+#stateBadge{
+  font-size:12.5px;font-weight:600;padding:5px 14px;border-radius:20px;color:#fff;
+  background:var(--idle);transition:background .25s;min-width:86px;text-align:center;
+}
+#stateBadge.s-draw{background:var(--ok)} #stateBadge.s-pause{background:var(--warn)}
+#stateBadge.s-erase{background:var(--danger)} #stateBadge.s-stop{background:var(--stop)}
+#stateBadge.s-idle{background:var(--idle)}
+
+/* ---------- 舞台（视频 + 画布叠加） ---------- */
+#stage{
+  position:relative;width:min(94vw,880px);aspect-ratio:4/3;border-radius:18px;overflow:hidden;
+  background:#0a0f1e;border:1px solid var(--line);
+  box-shadow:0 24px 70px rgba(0,0,0,.55), 0 0 0 1px rgba(99,102,241,.06);
+}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}/* 画面镜像，符合自拍直觉 */
+#paint{position:absolute;inset:0;width:100%;height:100%}
+
+/* 指尖光标：跟随食指尖端，样式随状态变化 */
+#cursor{
+  position:absolute;left:0;top:0;width:16px;height:16px;border-radius:50%;
+  transform:translate(-50%,-50%);pointer-events:none;display:none;z-index:5;
+  border:2.5px solid #fff;background:transparent;transition:border-color .15s;
+}
+#cursor.pen{background:var(--curColor,#fff);border-color:rgba(255,255,255,.85);box-shadow:0 0 10px var(--curColor,#fff)}
+#cursor.erase{border:2px dashed var(--danger);background:rgba(239,68,68,.12);border-radius:4px;width:30px;height:30px}
+#cursor.pause{border-color:var(--warn);background:rgba(245,158,11,.12)}
+#cursor.stop{border-color:var(--stop);opacity:.45}
+
+/* 落笔涟漪反馈 */
+.ripple{
+  position:absolute;width:14px;height:14px;border-radius:50%;pointer-events:none;z-index:4;
+  border:2px solid currentColor;transform:translate(-50%,-50%);color:#fff;
+  animation:rip .5s ease-out forwards;
+}
+.ripple.erase{color:var(--danger)}
+@keyframes rip{from{opacity:.9;scale:1}to{opacity:0;scale:5}}
+
+/* 未检测到手提示 */
+#noHandTip{
+  position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:6;
+  background:rgba(10,15,30,.72);backdrop-filter:blur(6px);border:1px solid var(--line);
+  color:var(--muted);font-size:12.5px;padding:6px 16px;border-radius:20px;display:none;
+}
+#noHandTip.show{display:block;animation:fadeIn .3s}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+/* ---------- 底部工具栏 ---------- */
+#toolbar{
+  width:min(94vw,880px);display:flex;flex-wrap:wrap;align-items:center;justify-content:center;
+  gap:10px 6px;padding:10px 12px;margin:12px 0 6px;border-radius:16px;
+  background:var(--panel);backdrop-filter:blur(12px);border:1px solid var(--line);
+}
+.tgroup{display:flex;align-items:center;gap:6px}
+.sep{width:1px;height:26px;background:var(--line);margin:0 4px}
+.tbtn{
+  width:38px;height:38px;border-radius:11px;border:1px solid transparent;cursor:pointer;
+  background:transparent;color:var(--muted);display:grid;place-items:center;
+  transition:all .18s;
+}
+.tbtn:hover{background:rgba(148,163,184,.12);color:var(--text)}
+.tbtn:disabled{opacity:.3;cursor:not-allowed}
+.tbtn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 4px 16px rgba(99,102,241,.4)}
+.tbtn.confirm{background:var(--danger);color:#fff}
+.tbtn svg{width:18px;height:18px}
+.tbtn .lbl{display:none}
+
+/* 色板 */
+#palette{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:center}
+.swatch{
+  width:21px;height:21px;border-radius:50%;cursor:pointer;border:2px solid transparent;
+  transition:transform .15s, border-color .15s;
+}
+.swatch:hover{transform:scale(1.25)}
+.swatch.active{border-color:#fff;transform:scale(1.3);box-shadow:0 0 8px rgba(255,255,255,.35)}
+
+/* 粗细滑块 */
+#sizeGroup{gap:9px}
+#sizeSlider{width:110px;accent-color:var(--accent);cursor:pointer}
+#sizeLabel{font-size:12px;color:var(--muted);min-width:38px;font-variant-numeric:tabular-nums}
+
+/* ---------- Toast 提示 ---------- */
+#toasts{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{
+  background:rgba(15,21,38,.92);border:1px solid var(--line);color:var(--text);
+  font-size:13px;padding:9px 20px;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.4);
+  animation:toastIn .25s ease-out;
+}
+.toast.warn{border-color:rgba(245,158,11,.4)} .toast.err{border-color:rgba(239,68,68,.4)}
+.toast.out{animation:toastOut .3s forwards}
+@keyframes toastIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateY(-8px)}}
+
+/* ---------- 启动页 / 加载页 / 错误页 覆盖层 ---------- */
+#overlay{
+  position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(900px 600px at 70% -10%,#1b2547 0%,#0a0f1e 60%);
+  transition:opacity .4s;
+}
+#overlay.hide{opacity:0;pointer-events:none}
+.card{
+  width:min(92vw,560px);background:var(--panel);backdrop-filter:blur(14px);
+  border:1px solid var(--line);border-radius:22px;padding:34px 38px;text-align:center;
+  box-shadow:0 30px 90px rgba(0,0,0,.5);
+}
+.card h1{
+  font-size:30px;letter-spacing:2px;
+  background:linear-gradient(135deg,#e2e8f0 20%,var(--accent) 60%,var(--accent2));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.card .sub{color:var(--muted);font-size:13.5px;margin:8px 0 22px;line-height:1.7}
+.card .sub b{color:var(--text);font-weight:600}
+
+/* 手势教程卡片 */
+#gestures{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:10px;margin-bottom:18px}
+.gcard{
+  background:rgba(148,163,184,.06);border:1px solid var(--line);border-radius:14px;
+  padding:14px 6px 12px;transition:transform .2s,border-color .2s;
+}
+.gcard:hover{transform:translateY(-3px);border-color:rgba(99,102,241,.45)}
+.gcard .ico{font-size:30px;line-height:1}
+.gcard .name{font-size:13px;font-weight:600;margin-top:8px}
+.gcard .desc{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
+
+.privacy{font-size:11.5px;color:var(--muted);margin-bottom:22px;line-height:1.7}
+.privacy b{color:var(--warn)}
+
+/* 启动 / 加载中 按钮 */
+#startBtn{
+  padding:13px 52px;font-size:16px;font-weight:600;letter-spacing:2px;cursor:pointer;
+  color:#fff;border:none;border-radius:14px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  box-shadow:0 10px 30px rgba(99,102,241,.45);transition:all .2s;
+}
+#startBtn:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(99,102,241,.6)}
+#startBtn:active{transform:none}
+
+#loadingBox{display:none}
+#loadingBox.show{display:block}
+.spinner{
+  width:38px;height:38px;margin:6px auto 16px;border-radius:50%;
+  border:3.5px solid rgba(148,163,184,.18);border-top-color:var(--accent);
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loadText{font-size:14px;color:var(--text)}
+#loadSub{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.7}
+
+/* 错误卡片 */
+#errorBox{display:none}
+#errorBox.show{display:block}
+#errorBox h2{font-size:18px;color:var(--danger);margin-bottom:10px}
+#errorBox p{font-size:13px;color:var(--muted);line-height:1.8;margin-bottom:6px;white-space:pre-line}
+#retryBtn{
+  margin-top:14px;padding:10px 34px;border-radius:12px;cursor:pointer;font-size:14px;
+  background:transparent;color:var(--text);border:1px solid var(--line);transition:all .2s;
+}
+#retryBtn:hover{border-color:var(--accent);color:var(--accent)}
+
+@media (max-width:640px){
+  .sep{display:none}
+  #toolbar{gap:8px}
+}
+</style>
+</head>
+<body>
+
+<!-- ================= 模块 1：页面结构 ================= -->
+<header id="topbar">
+  <div class="logo"><span class="dot"></span>空中画板 <small>Air Canvas · 手势隔空绘画</small></div>
+  <div class="top-right">
+    <span id="fps">-- FPS</span>
+    <span id="stateBadge" class="s-idle">未启动</span>
+  </div>
+</header>
+
+<main id="stage">
+  <video id="cam" autoplay muted playsinline></video>
+  <canvas id="paint" width="640" height="480"></canvas>
+  <div id="cursor"></div>
+  <div id="noHandTip">未检测到手 · 请将手伸到镜头前</div>
+</main>
+
+<footer id="toolbar">
+  <div class="tgroup" id="modeGroup">
+    <button class="tbtn active" id="btnPen" title="画笔模式（伸食指绘制）">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4L7 21H3v-4L17 3z"/></svg>
+    </button>
+    <button class="tbtn" id="btnEraser" title="橡皮擦（或握拳保持1秒切换）">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><path d="M5 13l8-8 5 5-7 7H7l-2-2v-2z"/></svg>
+    </button>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup" id="palette"><!-- 色板由 JS 生成 --></div>
+  <div class="sep"></div>
+  <div class="tgroup" id="sizeGroup">
+    <input type="range" id="sizeSlider" min="2" max="30" step="1" value="6" title="画笔粗细">
+    <span id="sizeLabel">6 px</span>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup">
+    <button class="tbtn" id="btnUndo" title="撤销 (Ctrl+Z)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10h10a5 5 0 015 5v1"/><path d="M3 10l4-4"/><path d="M3 10l4 4"/></svg>
+    </button>
+    <button class="tbtn" id="btnRedo" title="重做 (Ctrl+Y)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10H11a5 5 0 00-5 5v1"/><path d="M21 10l-4-4"/><path d="M21 10l-4 4"/></svg>
+    </button>
+    <button class="tbtn" id="btnClear" title="清空画布（点两次确认）">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>
+    </button>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup">
+    <button class="tbtn" id="btnPause" title="暂停 / 恢复追踪">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5v14"/><path d="M14 5v14"/></svg>
+    </button>
+    <button class="tbtn" id="btnSave" title="保存为 PNG 图片">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
+    </button>
+  </div>
+</footer>
+
+<div id="toasts"></div>
+
+<!-- 启动 / 加载 / 错误 覆盖层 -->
+<div id="overlay">
+  <!-- 启动页：手势教程 + 权限引导 -->
+  <div class="card" id="startBox">
+    <h1>空中画板</h1>
+    <p class="sub">基于 <b>MediaPipe Hands 手部追踪</b> 的隔空绘画网页<br>食指即是画笔，镜头前的空气就是画布</p>
+    <div id="gestures">
+      <div class="gcard"><div class="ico">☝️</div><div class="name">伸食指</div><div class="desc">开始绘制<br>指尖移动即落笔</div></div>
+      <div class="gcard"><div class="ico">✊</div><div class="name">握拳</div><div class="desc">暂停抬笔<br>可移动不画线</div></div>
+      <div class="gcard"><div class="ico">✊⏱️</div><div class="name">握拳 1 秒</div><div class="desc">切换画笔 / 橡皮擦<br>来回切换均可</div></div>
+      <div class="gcard"><div class="ico">🖐️</div><div class="name">张开手掌</div><div class="desc">停止待机<br>伸食指重新开始</div></div>
+    </div>
+    <p class="privacy">点击下方按钮后，浏览器将<b>请求摄像头权限</b>，请选择「允许」。<br>首次运行需联网加载手部追踪模型（约 3 MB，之后有缓存）。<br>摄像头画面<b>仅在本地浏览器内处理，不会上传任何数据</b>。</p>
+    <button id="startBtn">启 动 体 验</button>
+  </div>
+
+  <!-- 加载页：分步进度提示，避免"卡住无反馈" -->
+  <div class="card" id="loadingBox">
+    <div class="spinner"></div>
+    <div id="loadText">正在开启摄像头…</div>
+    <div id="loadSub">如果浏览器弹出权限询问，请选择「允许」</div>
+  </div>
+
+  <!-- 错误页：分类提示 + 重试 -->
+  <div class="card" id="errorBox">
+    <h2 id="errTitle">出错了</h2>
+    <p id="errMsg"></p>
+    <button id="retryBtn">重新加载页面</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ============================================================
+ * 模块 2：全局配置
+ * ============================================================ */
+const CONFIG = {
+  CANVAS_W: 640,          // 画布逻辑分辨率（与摄像头一致）
+  CANVAS_H: 480,
+  STABLE_FRAMES: 4,       // 手势稳定器：连续 N 帧一致才确认切换（防抖动误触发）
+  FIST_HOLD_MS: 1000,     // 握拳保持时长 → 切换 画笔/橡皮擦
+  NOHAND_MS: 1500,        // 手离开画面多久进入待机
+  HISTORY_MAX: 25,        // 撤销栈上限（640×480×4B ≈ 1.2MB/张，25 张约 30MB）
+  // One Euro 滤波参数：低速强滤波去抖、高速弱滤波保流畅（假设 30fps）
+  EURO: { minCutoff: 1.2, beta: 0.007, dCutoff: 1.0 },
+  // MediaPipe Hands 版本与 CDN 多源容错列表
+  HANDS_VER: '0.4.1675469240',
+  get CDN_BASES() {
+    return [
+      'https://cdn.jsdelivr.net/npm/@mediapipe/hands@' + this.HANDS_VER,
+      'https://unpkg.com/@mediapipe/hands@' + this.HANDS_VER
+    ];
+  }
+};
+
+const PALETTE = ['#ffffff','#f87171','#fb923c','#facc15','#4ade80','#22d3ee','#60a5fa','#a855f7','#f472b6','#1e293b'];
+
+/* 运行期全局状态 */
+const state = {
+  phase: 'BOOT',        // BOOT | IDLE | DRAW | PAUSE | ERASE | STOP
+  tool: 'pen',          // pen | eraser（当前工具，可用工具栏或握拳保持1秒切换）
+  color: '#ffffff',
+  penSize: 6,
+  running: false,       // 暂停按钮控制的追踪开关
+  lastHandTime: 0,      // 最近一次检测到手的时间戳
+  fistHoldStart: 0,     // 握拳开始时间（用于 1 秒计时）
+  fistHoldFired: false, // 本次握拳是否已触发过工具切换
+};
+
+/* DOM 引用集中管理 */
+const $ = id => document.getElementById(id);
+const video = $('cam'), paintCv = $('paint'), pctx = paintCv.getContext('2d', { willReadFrequently: true });
+const cursorEl = $('cursor'), badgeEl = $('stateBadge'), fpsEl = $('fps'), noHandTip = $('noHandTip');
+
+/* ============================================================
+ * 模块 3：CDN 多源容错加载器
+ * 动态创建 <script> 标签按需加载（页面打开时不预先加载模型，
+ * 只有点击"启动"后才开始，避免启动卡顿）。
+ * jsdelivr 失败自动切换 unpkg。
+ * ============================================================ */
+function loadScriptOnce(url, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    const timer = setTimeout(() => { s.remove(); reject(new Error('加载超时')); }, timeoutMs);
+    s.src = url;
+    s.onload = () => { clearTimeout(timer); resolve(); };
+    s.onerror = () => { clearTimeout(timer); s.remove(); reject(new Error('网络加载失败')); };
+    document.head.appendChild(s);
+  });
+}
+
+/** 依次尝试各 CDN 源加载 hands.js，全部失败抛出异常 */
+async function loadHandsLibrary() {
+  for (const base of CONFIG.CDN_BASES) {
+    try {
+      await loadScriptOnce(base + '/hands.js');
+      if (typeof window.Hands === 'function') return base; // 加载成功且全局对象可用
+    } catch (e) { /* 换下一个源 */ }
+  }
+  throw new Error('所有 CDN 均不可用');
+}
+
+/* ============================================================
+ * 模块 4：摄像头管理器
+ * 常见问题规避：
+ *   1. 只有用户点击"启动"后才申请权限（而非页面一打开就弹窗）；
+ *   2. file:// 或非安全上下文时 navigator.mediaDevices 不存在 → 给出指引；
+ *   3. 按错误类型给出针对性提示（权限拒绝 / 无设备 / 被占用）。
+ * ============================================================ */
+async function startCamera() {
+  // 安全上下文检测：部分浏览器在 file:// 下直接不暴露摄像头 API
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const e = new Error('当前浏览器在此打开方式下无法访问摄像头');
+    e.tip = '请改用 Chrome 或 Edge 直接双击打开本文件；\n若仍不行，可按 README 说明启动本地服务器后访问 localhost。';
+    throw e;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      audio: false
+    });
+  } catch (err) {
+    // 按错误类型给出可操作的解决建议
+    const map = {
+      NotAllowedError: '摄像头权限被拒绝。请点击地址栏左侧的相机/锁形图标，将摄像头设为「允许」后刷新页面重试。',
+      NotFoundError: '未检测到摄像头设备。请确认电脑已连接摄像头并启用。',
+      NotReadableError: '摄像头被其他程序占用（如腾讯会议 / Zoom 等）。请关闭占用程序后重试。'
+    };
+    err.tip = map[err.name] || ('摄像头打开失败：' + (err.message || err.name));
+    throw err;
+  }
+  video.srcObject = stream;
+  await video.play();                 // muted+autoplay 环境下 play() 不会被策略拦截
+  await new Promise(r => {             // 等待第一帧就绪，避免黑帧送入模型
+    if (video.readyState >= 2) return r();
+    video.onloadeddata = () => r();
+  });
+}
+
+/* ============================================================
+ * 模块 5：手势识别器
+ * MediaPipe Hands 输出 21 个手部关键点（归一化坐标）。
+ * 关键点索引：0手腕 4拇指尖 8食指尖 12中指尖 16无名指尖 20小指尖
+ *             5/9/13/17 分别为四指根部关节
+ *
+ * 判定思路（对远近、手掌大小不敏感）：
+ *   - 掌宽参考 = dist(手腕0, 中指根9)，用于拇指判定归一化；
+ *   - 四指伸直：指尖到手腕的距离 > (PIP关节到手腕距离 × 1.12)
+ *     （弯曲时指尖向掌心收拢，距手腕变近）；
+ *   - 拇指伸直：拇指尖到中指根距离 > 掌宽 × 0.7
+ *     （握拳时拇指横贴在四指上，距离显著变小）。
+ * 稳定器：连续 STABLE_FRAMES 帧判定一致才切换确认手势，
+ *         消除单帧抖动造成的误触发。
+ * ============================================================ */
+function dist2d(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return Math.hypot(dx, dy); }
+
+/** 由 21 个关键点判定每根手指的伸直状态 */
+function fingerStates(lm) {
+  const wrist = lm[0];
+  const palm = dist2d(lm[0], lm[9]) || 1e-6; // 掌宽参考值（防除零）
+  const ext = (tip, pip) => dist2d(lm[tip], wrist) > dist2d(lm[pip], wrist) * 1.12;
+  return {
+    index:  ext(8, 6),
+    middle: ext(12, 10),
+    ring:   ext(16, 14),
+    pinky:  ext(20, 18),
+    thumb:  dist2d(lm[4], lm[9]) > palm * 0.7
+  };
+}
+
+/** 将手指状态归类为四种手势之一 */
+function classifyGesture(f) {
+  if (f.index && !f.middle && !f.ring && !f.pinky) return 'INDEX';   // 只伸食指 → 绘制
+  if (!f.index && !f.middle && !f.ring && !f.pinky && !f.thumb) return 'FIST'; // 握拳 → 暂停
+  if (f.index && f.middle && f.ring && f.pinky && f.thumb) return 'PALM';      // 张开手掌 → 停止
+  return 'OTHER';                                                    // 其他 → 抬笔悬停
+}
+
+/** 手势稳定器：连续 N 帧一致才确认，防止边界抖动 */
+const stabilizer = {
+  lastRaw: null, count: 0, stable: null,
+  feed(raw) {
+    if (raw === this.lastRaw) this.count++;
+    else { this.lastRaw = raw; this.count = 1; }
+    if (this.count >= CONFIG.STABLE_FRAMES && raw !== this.stable) this.stable = raw;
+    return this.stable;
+  },
+  reset() { this.lastRaw = null; this.count = 0; this.stable = null; }
+};
+
+/* ============================================================
+ * 模块 6：状态机
+ * 状态：IDLE 待机(无手) | DRAW 绘制 | PAUSE 暂停抬笔 | ERASE 橡皮擦 | STOP 停止
+ * 转移表（g = 稳定后的手势）：
+ *   IDLE  --食指--> DRAW        DRAW  --握拳--> PAUSE
+ *   PAUSE --握拳保持1s--> 切换工具(画笔/橡皮擦)
+ *   PAUSE --食指--> DRAW/ERASE    任意 --张开手掌--> STOP
+ *   STOP  --食指--> DRAW         任意 --手离开1.5s--> IDLE
+ *   任意 --其他手势--> PAUSE(仅抬笔，不改状态徽章)
+ * ============================================================ */
+function setState(next) {
+  if (state.phase === next) return;
+  if (state.phase === 'DRAW' || state.phase === 'ERASE') draw.endStroke(); // 离开绘制状态必须抬笔
+  state.phase = next;
+  updateBadge();
+}
+
+/** 每帧驱动状态机；返回当前是否处于"笔在纸上"的绘制状态 */
+function stepStateMachine(gesture, hasHand, now) {
+  // --- 无手 1.5 秒 → 待机 ---
+  if (!hasHand) {
+    if (state.phase !== 'IDLE' && now - state.lastHandTime > CONFIG.NOHAND_MS) setState('IDLE');
+    return false;
+  }
+  state.lastHandTime = now;
+
+  switch (gesture) {
+    case 'INDEX': {
+      // 伸食指：按当前工具进入对应绘制状态
+      const target = state.tool === 'eraser' ? 'ERASE' : 'DRAW';
+      setState(target);
+      return state.phase === target; // 只有刚进入（或已处于）绘制状态才落笔
+    }
+    case 'FIST': {
+      setState('PAUSE');
+      // 握拳计时：持续 1 秒 → 切换画笔/橡皮擦（可来回切换）
+      if (!state.fistHoldStart) { state.fistHoldStart = now; state.fistHoldFired = false; }
+      else if (!state.fistHoldFired && now - state.fistHoldStart >= CONFIG.FIST_HOLD_MS) {
+        state.fistHoldFired = true;
+        setTool(state.tool === 'pen' ? 'eraser' : 'pen', true);
+      }
+      return false;
+    }
+    case 'PALM': setState('STOP'); return false;   // 张开手掌 → 停止待机
+    default:                                     // OTHER：其他手势一律抬笔，进入暂停态
+      setState('PAUSE');
+      draw.endStroke();
+      return false;
+  }
+}
+
+/* ============================================================
+ * 模块 7：One Euro 自适应滤波器（笔迹平滑防抖核心）
+ * 原理：一阶低通滤波，但截止频率随速度自适应——
+ *   指尖移动慢 → 截止频率低 → 滤波强 → 消除手抖；
+ *   指尖移动快 → 截止频率高 → 滤波弱 → 保留快速挥笔的流畅轨迹。
+ * 论文：Casiez et al., "1€ Filter", CHI 2012
+ * x、y 两个维度分别独立滤波。
+ * ============================================================ */
+class LowPass {
+  constructor() { this.y = null; }
+  reset() { this.y = null; }
+  filter(x, alpha) { this.y = (this.y === null) ? x : alpha * x + (1 - alpha) * this.y; return this.y; }
+}
+
+class OneEuroFilter {
+  constructor(minCutoff, beta, dCutoff) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.xF = new LowPass(); this.dxF = new LowPass();
+    this.tPrev = null; this.xPrev = 0;
+  }
+  reset() { this.xF.reset(); this.dxF.reset(); this.tPrev = null; }
+  /** 滤波器的平滑系数：截止频率越低（tau 越大）α 越小 → 平滑越强 */
+  alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  filter(x, tMs) {
+    if (this.tPrev === null) { this.tPrev = tMs; this.xPrev = x; this.xF.reset(); return x; }
+    const dt = Math.max((tMs - this.tPrev) / 1000, 1e-3); // 秒，防除零
+    this.tPrev = tMs;
+    // 估计速度并对其做低通（抑制噪声引起的伪速度）
+    const dx = (x - this.xPrev) / dt; this.xPrev = x;
+    const edx = this.dxF.filter(dx, this.alpha(this.dCutoff, dt));
+    // 自适应截止频率：速度越快截止越高（beta 加权）
+    const cutoff = this.minCutoff + this.beta * Math.abs(edx);
+    return this.xF.filter(x, this.alpha(cutoff, dt));
+  }
+}
+
+/** 二维坐标封装：对 x/y 分别滤波；抬笔后 reset 防止新旧笔画间"飞线" */
+const smoother = {
+  fx: new OneEuroFilter(CONFIG.EURO.minCutoff, CONFIG.EURO.beta, CONFIG.EURO.dCutoff),
+  fy: new OneEuroFilter(CONFIG.EURO.minCutoff, CONFIG.EURO.beta, CONFIG.EURO.dCutoff),
+  reset() { this.fx.reset(); this.fy.reset(); },
+  next(x, y, t) { return { x: this.fx.filter(x, t), y: this.fy.filter(y, t) }; }
+};
+
+/* ============================================================
+ * 模块 8：绘图引擎
+ * 画布为透明层叠加在镜像视频上方，逻辑分辨率 640×480。
+ * 笔迹绘制：二次贝塞尔中点插值——以上一段中点为起点、
+ *   关键点为控制点、下一段中点为终点，天然圆滑无折角。
+ * 橡皮擦：globalCompositeOperation = 'destination-out'，
+ *   粗线扫过即从已画内容中"减去"。
+ * 落笔反馈：起点画圆点 + 涟漪动画。
+ * ============================================================ */
+const draw = {
+  pts: [],        // 当前笔画最近的关键点（贝塞尔需要保留最近 3 个）
+  active: false,
+
+  /** 橡皮擦粗细 = 画笔粗细 × 4（夹在 20~90 之间，保证擦得动） */
+  eraserWidth() { return Math.min(90, Math.max(20, state.penSize * 4)); },
+
+  beginStroke(p, erasing) {
+    history.pushSnapshot();                    // 新笔画开始前快照 → 供撤销
+    this.active = true; this.erasing = erasing;
+    this.pts = [p];
+    this.dot(p, erasing);                      // 落笔圆点
+    spawnRipple(p, erasing);                   // 落笔涟漪动画（UI 反馈）
+  },
+
+  extendStroke(p) {
+    if (!this.active) return;
+    this.pts.push(p);
+    const n = this.pts.length;
+    if (n >= 3) {
+      const [a, b, c] = [this.pts[n - 3], this.pts[n - 2], this.pts[n - 1]];
+      // 中点插值：起点=ab中点，控制点=b，终点=bc中点
+      this.seg({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, b, { x: (b.x + c.x) / 2, y: (b.y + c.y) / 2 });
+      this.pts = this.pts.slice(-2);           // 只保留最近 2 点，控制内存
+    } else if (n === 2) {
+      this.seg(this.pts[0], this.pts[0], { x: (this.pts[0].x + p.x) / 2, y: (this.pts[0].y + p.y) / 2 });
+    }
+  },
+
+  endStroke() {
+    if (!this.active) { this.pts = []; return; }
+    // 收尾：把最后半段补画到末端点
+    const n = this.pts.length;
+    if (n >= 2) this.seg(this.pts[n - 2], this.pts[n - 1], this.pts[n - 1]);
+    this.active = false; this.pts = [];
+  },
+
+  /** 画一段贝塞尔曲线（或擦除段） */
+  seg(p0, p1, p2) {
+    const erasing = this.erasing;
+    pctx.save();
+    if (erasing) {
+      pctx.globalCompositeOperation = 'destination-out';
+      pctx.lineWidth = this.eraserWidth();
+    } else {
+      pctx.strokeStyle = state.color;
+      pctx.lineWidth = state.penSize;
+      pctx.shadowColor = state.color; pctx.shadowBlur = 8;  // 霓虹发光效果
+    }
+    pctx.lineCap = 'round'; pctx.lineJoin = 'round';
+    pctx.beginPath();
+    pctx.moveTo(p0.x, p0.y);
+    pctx.quadraticCurveTo(p1.x, p1.y, p2.x, p2.y);
+    pctx.stroke();
+    pctx.restore();
+  },
+
+  /** 落笔圆点 */
+  dot(p, erasing) {
+    pctx.save();
+    if (erasing) {
+      pctx.globalCompositeOperation = 'destination-out';
+      pctx.beginPath(); pctx.arc(p.x, p.y, this.eraserWidth() / 2, 0, Math.PI * 2); pctx.fill();
+    } else {
+      pctx.fillStyle = state.color;
+      pctx.shadowColor = state.color; pctx.shadowBlur = 10;
+      pctx.beginPath(); pctx.arc(p.x, p.y, state.penSize / 2, 0, Math.PI * 2); pctx.fill();
+    }
+    pctx.restore();
+  }
+};
+
+/* ============================================================
+ * 模块 9：撤销 / 重做（ImageData 快照双栈）
+ * 快照时机：每个笔画"开始前"压栈（含清空前）——
+ *   撤销一次即回到上一笔画之前的状态，语义直观。
+ * 新笔画开始时清空重做栈（标准编辑器行为）。
+ * ============================================================ */
+const history = {
+  undoStack: [], redoStack: [],
+  snapshot() { return pctx.getImageData(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H); },
+  pushSnapshot() {
+    this.undoStack.push(this.snapshot());
+    if (this.undoStack.length > CONFIG.HISTORY_MAX) this.undoStack.shift(); // 超限丢弃最旧
+    this.redoStack.length = 0;
+    updateHistoryButtons();
+  },
+  undo() {
+    if (!this.undoStack.length) return toast('没有可撤销的操作', 'warn');
+    this.redoStack.push(this.snapshot());
+    pctx.putImageData(this.undoStack.pop(), 0, 0);
+    updateHistoryButtons();
+  },
+  redo() {
+    if (!this.redoStack.length) return toast('没有可重做的操作', 'warn');
+    this.undoStack.push(this.snapshot());
+    pctx.putImageData(this.redoStack.pop(), 0, 0);
+    updateHistoryButtons();
+  }
+};
+
+/* ============================================================
+ * 模块 10：工具栏与交互 UI
+ * ============================================================ */
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, 2100);
+}
+
+function updateBadge() {
+  const map = {
+    BOOT: ['未启动', ''], IDLE: ['未检测到手', 's-idle'], DRAW: ['绘制中', 's-draw'],
+    PAUSE: ['暂停 · 抬笔', 's-pause'], ERASE: ['橡皮擦中', 's-erase'], STOP: ['已停止', 's-stop']
+  };
+  const [text, cls] = map[state.phase];
+  badgeEl.textContent = text;
+  badgeEl.className = cls;
+}
+
+function updateHistoryButtons() {
+  $('btnUndo').disabled = !history.undoStack.length;
+  $('btnRedo').disabled = !history.redoStack.length;
+}
+
+/** 切换画笔/橡皮工具；byGesture=true 表示来自握拳手势 */
+function setTool(tool, byGesture) {
+  state.tool = tool;
+  $('btnPen').classList.toggle('active', tool === 'pen');
+  $('btnEraser').classList.toggle('active', tool === 'eraser');
+  // 工具切换时结束当前笔画，避免一支笔画到一半换风格
+  draw.endStroke();
+  if (byGesture) toast(tool === 'eraser' ? '已切换到橡皮擦（握拳 1 秒切回画笔）' : '已切换到画笔');
+  updateCursorStyle();
+}
+
+/** 落笔涟漪动画（DOM 元素，600ms 后自动移除） */
+function spawnRipple(p, erasing) {
+  const r = document.createElement('span');
+  r.className = 'ripple' + (erasing ? ' erase' : '');
+  r.style.left = (p.x / CONFIG.CANVAS_W * 100) + '%';
+  r.style.top = (p.y / CONFIG.CANVAS_H * 100) + '%';
+  $('stage').appendChild(r);
+  setTimeout(() => r.remove(), 600);
+}
+
+/** 按状态更新指尖光标样式 */
+function updateCursorStyle() {
+  cursorEl.className = '';
+  switch (state.phase) {
+    case 'DRAW':
+      cursorEl.classList.add('pen');
+      cursorEl.style.setProperty('--curColor', state.color);
+      break;
+    case 'ERASE': cursorEl.classList.add('erase'); break;
+    case 'PAUSE': cursorEl.classList.add('pause'); break;
+    case 'STOP': cursorEl.classList.add('stop'); break;
+  }
+}
+
+/** 更新光标位置（画布逻辑坐标 → 舞台百分比，天然适配缩放） */
+function moveCursor(p) {
+  cursorEl.style.display = 'block';
+  cursorEl.style.left = (p.x / CONFIG.CANVAS_W * 100) + '%';
+  cursorEl.style.top = (p.y / CONFIG.CANVAS_H * 100) + '%';
+}
+
+function initToolbar() {
+  // 色板
+  PALETTE.forEach((c, i) => {
+    const s = document.createElement('button');
+    s.className = 'swatch' + (i === 0 ? ' active' : '');
+    s.style.background = c;
+    s.title = c;
+    s.onclick = () => {
+      state.color = c;
+      document.querySelectorAll('.swatch').forEach(x => x.classList.remove('active'));
+      s.classList.add('active');
+      if (state.tool === 'eraser') setTool('pen'); // 选颜色自动回到画笔
+      updateCursorStyle();
+    };
+    $('palette').appendChild(s);
+  });
+
+  // 粗细滑块
+  $('sizeSlider').oninput = e => {
+    state.penSize = +e.target.value;
+    $('sizeLabel').textContent = state.penSize + ' px';
+  };
+
+  // 工具按钮
+  $('btnPen').onclick = () => setTool('pen');
+  $('btnEraser').onclick = () => setTool('eraser');
+
+  // 撤销 / 重做（含键盘快捷键）
+  $('btnUndo').onclick = () => history.undo();
+  $('btnRedo').onclick = () => history.redo();
+  document.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); history.undo(); }
+    if (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z')) { e.preventDefault(); history.redo(); }
+  });
+
+  // 清空：两段式确认（第一次点击变红提示，3 秒内再点一次才执行）
+  let clearArmed = 0, clearTimer = null;
+  $('btnClear').onclick = () => {
+    const btn = $('btnClear');
+    if (clearArmed && Date.now() - clearArmed < 3000) {
+      history.pushSnapshot();                                   // 清空前同样可撤销
+      pctx.clearRect(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
+      clearArmed = 0; btn.classList.remove('confirm');
+      clearTimeout(clearTimer);
+      toast('画布已清空（可撤销）');
+    } else {
+      clearArmed = Date.now();
+      btn.classList.add('confirm');
+      toast('再点一次「清空」确认', 'warn');
+      clearTimeout(clearTimer);
+      clearTimer = setTimeout(() => { btn.classList.remove('confirm'); clearArmed = 0; }, 3000);
+    }
+  };
+
+  // 暂停 / 恢复追踪
+  $('btnPause').onclick = () => {
+    state.running = !state.running;
+    const icon = $('btnPause');
+    if (state.running) { setState('IDLE'); startLoop(); toast('已恢复追踪'); icon.classList.remove('active'); }
+    else { draw.endStroke(); setState('PAUSE'); toast('已暂停追踪（点击恢复）', 'warn'); icon.classList.add('active'); }
+  };
+
+  // 保存 PNG
+  $('btnSave').onclick = savePNG;
+  updateHistoryButtons();
+}
+
+/* ============================================================
+ * 模块 11：PNG 导出
+ * 新建临时画布：深色底 + 作品内容（摄像头画面不导出，只留笔迹）
+ * ============================================================ */
+function savePNG() {
+  const t = document.createElement('canvas');
+  t.width = CONFIG.CANVAS_W; t.height = CONFIG.CANVAS_H;
+  const c = t.getContext('2d');
+  c.fillStyle = '#0b1120'; c.fillRect(0, 0, t.width, t.height);   // 深色底衬托霓虹笔迹
+  c.drawImage(paintCv, 0, 0);
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
+  a.download = 'aircanvas_' + ts + '.png';
+  a.href = t.toDataURL('image/png');
+  a.click();
+  toast('已保存为 PNG 图片');
+}
+
+/* ============================================================
+ * 模块 12：主流程编排
+ * 启动流程：点击启动 → 开摄像头 → 加载 MediaPipe（CDN 容错）
+ *           → 首帧识别成功后进入主界面
+ * 主循环：rAF + hands.send 逐帧识别
+ *   onResults：关键点 → 手势稳定 → 状态机 → 滤波 → 绘制/抬笔
+ * ============================================================ */
+let hands = null;          // MediaPipe Hands 实例
+let sendBusy = false;      // 防止上一帧未处理完就送下一帧
+let firstResult = true;    // 首帧标志（用于关闭加载动画）
+let lastT = performance.now(), fpsEMA = 0;
+
+/** MediaPipe 每帧识别结果回调（真正的"主循环体"） */
+function onResults(results) {
+  const now = performance.now();
+
+  // --- FPS 统计（指数滑动平均） ---
+  const dt = now - lastT; lastT = now;
+  const f = 1000 / Math.max(dt, 1);
+  fpsEMA = fpsEMA ? fpsEMA * 0.9 + f * 0.1 : f;
+  fpsEl.textContent = Math.round(fpsEMA) + ' FPS';
+
+  // --- 首帧到达：关闭加载页，进入主界面 ---
+  if (firstResult) {
+    firstResult = false;
+    $('overlay').classList.add('hide');
+    toast('将手伸到镜头前，伸出食指即可开始绘画');
+  }
+
+  const lms = results.multiHandLandmarks;
+  const hasHand = lms && lms.length > 0;
+
+  if (!hasHand) {
+    stepStateMachine(null, false, now);
+    state.fistHoldStart = 0; state.fistHoldFired = false; // 手丢失时重置握拳计时，防止回来误触发
+    cursorEl.style.display = 'none';
+    // 丢帧抖动容错：连续约 0.6 秒无手才显示提示，避免闪烁
+    if (state.lastHandTime && now - state.lastHandTime > 600) noHandTip.classList.add('show');
+    return;
+  }
+  noHandTip.classList.remove('show');
+
+  const lm = lms[0];                          // 只追踪一只手（性能考虑）
+  const gesture = stabilizer.feed(classifyGesture(fingerStates(lm)));
+  const drawing = stepStateMachine(gesture, true, now);
+
+  // --- 食指尖端(8号点)坐标：视频做了镜像显示，x 坐标需要取反 ---
+  const raw = { x: (1 - lm[8].x) * CONFIG.CANVAS_W, y: lm[8].y * CONFIG.CANVAS_H };
+
+  if (drawing) {
+    const p = smoother.next(raw.x, raw.y, now);
+    if (!draw.active) {
+      smoother.reset();                       // 新笔画从当前点起步，防止从旧位置"飞线"
+      const p0 = smoother.next(raw.x, raw.y, now);
+      draw.beginStroke(p0, state.tool === 'eraser');
+    } else {
+      draw.extendStroke(p);
+    }
+    moveCursor(p);
+  } else {
+    smoother.reset();                         // 抬笔期间持续重置，恢复落笔时不跳变
+    moveCursor(raw);
+  }
+  updateCursorStyle();
+
+  // --- 手势离开握拳状态时，重置握拳计时器 ---
+  if (gesture !== 'FIST') { state.fistHoldStart = 0; state.fistHoldFired = false; }
+}
+
+/** rAF 主循环：逐帧把视频画面送入识别器 */
+function startLoop() {
+  requestAnimationFrame(async () => {
+    if (!state.running) return;
+    if (!sendBusy && video.readyState >= 2) {
+      sendBusy = true;
+      try { await hands.send({ image: video }); } catch (e) { /* 单帧失败忽略 */ }
+      sendBusy = false;
+    }
+    startLoop();
+  });
+}
+
+/** 显示错误卡片（分类提示） */
+function showError(err) {
+  $('startBox').style.display = 'none';
+  $('loadingBox').classList.remove('show');
+  const box = $('errorBox');
+  box.classList.add('show');
+  $('errTitle').textContent = '启动失败';
+  $('errMsg').textContent = (err.tip || err.message || '未知错误') +
+    (err.message && err.tip ? '\n（技术信息：' + err.message + '）' : '');
+}
+
+/** 启动按钮点击后的完整初始化流程 */
+async function boot() {
+  const loading = $('loadingBox');
+  try {
+    $('startBox').style.display = 'none';
+    loading.classList.add('show');
+
+    // 第 1 步：摄像头（此时才申请权限）
+    $('loadText').textContent = '正在开启摄像头…';
+    $('loadSub').textContent = '如果浏览器弹出权限询问，请选择「允许」';
+    await startCamera();
+
+    // 第 2 步：按需加载手部识别库（CDN 多源容错）
+    $('loadText').textContent = '正在加载手部追踪模型…';
+    $('loadSub').textContent = '首次运行需联网下载约 3 MB，之后有浏览器缓存';
+    const base = await loadHandsLibrary();
+
+    // 第 3 步：初始化 MediaPipe Hands
+    hands = new window.Hands({
+      // locateFile：告诉 MediaPipe 到哪个 CDN 找 wasm/模型文件
+      locateFile: f => base + '/' + f
+    });
+    hands.setOptions({
+      maxNumHands: 1,               // 只识别一只手（降低计算量）
+      modelComplexity: 1,           // 0=轻量(快) 1=完整(准)，取平衡
+      minDetectionConfidence: 0.6,  // 检测置信度阈值
+      minTrackingConfidence: 0.5    // 跟踪置信度阈值
+    });
+    hands.onResults(onResults);
+
+    // 第 4 步：启动主循环（首帧识别成功后 onResults 里自动收起加载页）
+    $('loadText').textContent = '正在初始化识别引擎…';
+    state.phase = 'IDLE'; updateBadge();
+    state.running = true;
+    startLoop();
+  } catch (err) {
+    showError(err);
+  }
+}
+
+/* ---------- 页面入口 ---------- */
+$('startBtn').addEventListener('click', boot);
+$('retryBtn').addEventListener('click', () => location.reload());
+initToolbar();
+updateBadge();
+</script>
+</body>
+</html>
