@@ -1,0 +1,7 @@
+.workbuddy/
+node_modules/
+output/
+publish/
+*.docx
+.DS_Store
+*.genie

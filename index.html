@@ -12,19 +12,29 @@
   技术栈：HTML5 + CSS3 + 原生 JavaScript + MediaPipe Hands
   运行方式：Chrome / Edge 双击打开本文件即可
 
+  功能模块（页面层）：
+    首页      自由画板（主）/ 模仿挑战 / 我的画廊
+    自由画板  手势绘制、橡皮、色板、粗细、撤销重做、清空、暂停、导出、存入画廊
+    模仿挑战  照着内置线稿画，chamfer 距离变换打分（0-100），三色重合可视化
+    我的画廊  localStorage 存作品，缩略图网格 + 大图灯箱
+
   文件内部模块划分（便于查阅实现过程）：
-    模块 1  UI 结构与样式（HTML + CSS）
-    模块 2  全局配置 CONFIG
-    模块 3  CDN 多源容错加载器
-    模块 4  摄像头管理器
-    模块 5  手势识别器（21 关键点归一化判定 + 稳定器）
-    模块 6  状态机（绘制 / 暂停 / 橡皮擦 / 停止 / 待机）
-    模块 7  One Euro 自适应滤波器 + 贝塞尔平滑
-    模块 8  绘图引擎（落笔 / 笔画 / 橡皮擦）
-    模块 9  撤销 / 重做（ImageData 快照栈）
-    模块 10 工具栏与交互 UI
-    模块 11 PNG 导出
-    模块 12 主流程编排
+    模块 1   UI 结构与样式（HTML + CSS）
+    模块 2   全局配置 CONFIG
+    模块 3   CDN 多源容错加载器
+    模块 4   摄像头管理器
+    模块 5   手势识别器（21 关键点归一化判定 + 稳定器）
+    模块 6   状态机（绘制 / 暂停 / 橡皮擦 / 停止 / 待机）
+    模块 7   One Euro 自适应滤波器 + 贝塞尔平滑
+    模块 8   绘图引擎工厂 createDrawEngine（两块画布各一套）
+    模块 9   撤销 / 重做工厂 createHistory
+    模块 10  通用 UI（toast / 徽章 / 光标 / 涟漪 / 工具栏工厂）
+    模块 11  视图路由 + 舞台吸附 + 主循环控制器
+    模块 12  导出与作品快照
+    模块 13  模仿挑战（线稿数据 / 参考图渲染 / 评分算法 / 三色图）
+    模块 14  我的画廊（存储 / 网格 / 灯箱 / 配额处理）
+    模块 15  主流程编排（onResults / boot）
+    模块 16  页面入口
   ============================================================
 -->
 <style>
@@ -34,6 +44,9 @@
   --text:#e2e8f0; --muted:#8794ad;
   --accent:#6366f1; --accent2:#a855f7;
   --ok:#22c55e; --warn:#f59e0b; --danger:#ef4444; --idle:#64748b; --stop:#818cf8;
+  --ref:#60a5fa; --mine:#f87171; --both:#ffffff;
+  /* 舞台最大宽度：按视口高度反推 4:3，保证画布 + 工具栏一屏放得下 */
+  --stage-max:max(430px, calc((100vh - 220px) * 4 / 3));
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
@@ -46,30 +59,161 @@ body{
 
 /* ---------- 顶部状态栏 ---------- */
 #topbar{
-  width:min(94vw,880px);display:flex;align-items:center;justify-content:space-between;
-  padding:14px 4px 10px;
+  width:min(96vw,1100px);display:flex;align-items:center;justify-content:space-between;
+  padding:14px 4px 12px;gap:12px;
 }
-.logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700;letter-spacing:1px}
-.logo .dot{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 12px var(--accent)}
+.top-left{display:flex;align-items:center;gap:12px;min-width:0}
+#btnBack{
+  display:none;align-items:center;gap:5px;font:inherit;font-size:12.5px;cursor:pointer;
+  padding:6px 12px;border-radius:10px;color:var(--muted);
+  background:rgba(148,163,184,.08);border:1px solid var(--line);transition:all .18s;
+}
+#btnBack.show{display:inline-flex}
+#btnBack:hover{color:var(--text);border-color:rgba(99,102,241,.45)}
+.logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700;letter-spacing:1px;white-space:nowrap}
+.logo .dot{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 12px var(--accent);flex:none}
 .logo small{color:var(--muted);font-weight:400;font-size:12px}
-.top-right{display:flex;align-items:center;gap:10px}
+.top-right{display:flex;align-items:center;gap:10px;flex:none}
 #fps{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;background:var(--panel);border:1px solid var(--line);padding:4px 10px;border-radius:20px}
 #stateBadge{
   font-size:12.5px;font-weight:600;padding:5px 14px;border-radius:20px;color:#fff;
-  background:var(--idle);transition:background .25s;min-width:86px;text-align:center;
+  background:var(--idle);transition:background .25s,opacity .25s;min-width:86px;text-align:center;
 }
 #stateBadge.s-draw{background:var(--ok)} #stateBadge.s-pause{background:var(--warn)}
 #stateBadge.s-erase{background:var(--danger)} #stateBadge.s-stop{background:var(--stop)}
 #stateBadge.s-idle{background:var(--idle)}
 
-/* ---------- 舞台（视频 + 画布叠加） ---------- */
+/* ---------- 账号区（未配置 Supabase 时整体不出现） ---------- */
+#userBox{display:none;align-items:center;gap:8px}
+#userBox.show{display:flex}
+#userName{
+  font-size:12.5px;color:var(--text);max-width:120px;padding:5px 11px;border-radius:20px;
+  background:rgba(99,102,241,.14);border:1px solid rgba(99,102,241,.28);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.auth-btn{
+  display:none;font:inherit;font-size:12.5px;cursor:pointer;padding:6px 13px;border-radius:10px;
+  background:rgba(99,102,241,.16);color:#c7d2fe;border:1px solid rgba(99,102,241,.35);
+  transition:all .18s;white-space:nowrap;
+}
+.auth-btn.show{display:inline-block}
+.auth-btn:hover{background:rgba(99,102,241,.3);border-color:var(--accent);color:#fff}
+.auth-btn.ghost{background:transparent;color:var(--muted);border-color:var(--line)}
+.auth-btn.ghost:hover{color:var(--text);background:rgba(148,163,184,.1);border-color:rgba(148,163,184,.3)}
+
+/* ---------- 登录 / 注册弹窗 ---------- */
+#authModal{
+  position:fixed;inset:0;z-index:130;display:none;align-items:center;justify-content:center;
+  background:rgba(4,8,18,.8);backdrop-filter:blur(6px);padding:20px;
+}
+#authModal.show{display:flex}
+.auth-card{
+  position:relative;width:100%;max-width:382px;border-radius:20px;
+  background:linear-gradient(180deg,#111a30,#0c1322);border:1px solid var(--line);
+  padding:30px 28px 24px;box-shadow:0 26px 70px rgba(0,0,0,.55);
+}
+.auth-card h3{font-size:19px;margin-bottom:7px}
+.auth-sub{font-size:12.5px;color:var(--muted);line-height:1.75;margin-bottom:20px}
+.auth-field{margin-bottom:13px}
+.auth-field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.auth-field input{
+  width:100%;font:inherit;font-size:14px;padding:11px 13px;border-radius:11px;
+  background:rgba(6,10,20,.72);border:1px solid var(--line);color:var(--text);
+  outline:none;transition:border-color .18s;user-select:text;
+}
+.auth-field input:focus{border-color:var(--accent);background:rgba(6,10,20,.95)}
+.auth-field input::placeholder{color:#4d5a70}
+.auth-error{
+  display:none;font-size:12.5px;color:#fca5a5;background:rgba(239,68,68,.1);
+  border:1px solid rgba(239,68,68,.26);border-radius:10px;padding:9px 12px;
+  line-height:1.6;margin-bottom:13px;
+}
+.auth-error.show{display:block}
+.auth-actions{display:flex;gap:10px;margin-top:18px}
+.auth-actions .btn{flex:1;justify-content:center;padding:11px 0}
+.auth-switch{text-align:center;font-size:12.5px;color:var(--muted);margin-top:15px}
+.auth-switch b{color:#a5b4fc;cursor:pointer;font-weight:500}
+.auth-switch b:hover{text-decoration:underline}
+.auth-note{font-size:11.5px;color:#5b6880;line-height:1.7;margin-top:13px;text-align:center}
+#authModal.busy .auth-actions .btn{opacity:.55;pointer-events:none}
+
+/* ---------- 视图容器 ---------- */
+#views{position:relative;width:min(96vw,1100px);margin:0 auto;padding-bottom:18px}
+.view{display:none}
+.view.active{display:block;animation:viewIn .25s ease-out}
+@keyframes viewIn{from{opacity:0}to{opacity:1}}
+
+/* ---------- 首页：主卡 + 两张小卡 ---------- */
+.home-hero{
+  position:relative;display:flex;align-items:center;justify-content:space-between;gap:28px;
+  min-height:min(68vh,600px);border-radius:24px;padding:42px 46px;overflow:hidden;cursor:pointer;
+  background:
+    radial-gradient(760px 420px at 82% 14%,rgba(99,102,241,.30),transparent 62%),
+    radial-gradient(520px 320px at 96% 88%,rgba(168,85,247,.18),transparent 60%),
+    linear-gradient(150deg,#141d33 0%,#0c1322 55%,#090e1a 100%);
+  border:1px solid rgba(148,163,184,.16);
+  box-shadow:0 30px 80px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);
+  transition:transform .25s,border-color .25s,box-shadow .25s;
+}
+.home-hero:hover{transform:translateY(-3px);border-color:rgba(99,102,241,.5);box-shadow:0 36px 96px rgba(0,0,0,.62)}
+.home-hero:active{transform:none}
+.hero-copy{position:relative;z-index:2;max-width:520px}
+.hero-flag{
+  display:inline-block;font-size:11.5px;letter-spacing:1px;color:#c7d2fe;
+  padding:5px 12px;border-radius:20px;background:rgba(99,102,241,.16);
+  border:1px solid rgba(99,102,241,.35);margin-bottom:18px;
+}
+.hero-copy h2{font-size:40px;line-height:1.1;letter-spacing:2px;
+  background:linear-gradient(120deg,#fff 30%,#a5b4fc 70%,#a855f7);
+  -webkit-background-clip:text;background-clip:text;color:transparent;}
+.hero-copy p{color:var(--muted);font-size:14px;line-height:1.85;margin-top:14px}
+.hero-points{display:flex;flex-wrap:wrap;gap:8px;list-style:none;margin-top:18px}
+.hero-points li{font-size:12px;color:#cbd5e1;padding:5px 11px;border-radius:8px;
+  background:rgba(148,163,184,.10);border:1px solid var(--line)}
+.hero-cta{display:inline-block;margin-top:26px;padding:12px 30px;border-radius:13px;font-size:14.5px;font-weight:600;letter-spacing:1px;
+  color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  box-shadow:0 12px 30px rgba(99,102,241,.42);transition:transform .2s,box-shadow .2s}
+.home-hero:hover .hero-cta{transform:translateX(3px);box-shadow:0 16px 38px rgba(99,102,241,.55)}
+.hero-art{position:relative;z-index:1;width:44%;max-width:420px;flex:none;opacity:.95}
+.hero-art svg{width:100%;height:auto;display:block;filter:drop-shadow(0 8px 30px rgba(99,102,241,.35))}
+.hero-art .hero-stroke{stroke-dasharray:520;stroke-dashoffset:0;animation:drawIn 3.4s ease-out both}
+.hero-art .hero-stroke.s2{animation-delay:.45s;opacity:.75}
+@keyframes drawIn{from{stroke-dasharray:0 520}to{stroke-dasharray:520 0}}
+.hero-tip{position:absolute;left:50%;bottom:2px;transform:translateX(-50%);white-space:nowrap;
+  font-size:11.5px;color:var(--muted);padding:5px 13px;border-radius:20px;
+  background:rgba(10,15,30,.6);border:1px solid var(--line);backdrop-filter:blur(6px)}
+
+.home-mini{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.mini-card{
+  display:flex;align-items:center;gap:13px;padding:15px 18px;min-height:84px;border-radius:18px;
+  background:var(--panel);border:1px solid var(--line);cursor:pointer;text-align:left;color:var(--text);
+  font:inherit;transition:transform .2s,border-color .2s,background .2s;overflow:hidden;
+}
+.mini-card:hover{transform:translateY(-2px);border-color:rgba(99,102,241,.45);background:rgba(30,41,70,.9)}
+.mini-ico{font-size:26px;flex:none;line-height:1}
+.mini-text{display:flex;flex-direction:column;gap:4px;min-width:0}
+.mini-text b{font-size:15px;letter-spacing:.5px}
+.mini-text em{font-style:normal;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mini-arrow{margin-left:auto;color:var(--muted);font-size:18px;flex:none}
+.mini-thumb{width:66px;height:50px;object-fit:cover;border-radius:9px;border:1px solid var(--line);display:none;margin-left:6px;flex:none}
+
+/* ---------- 舞台（视频 + 画布叠加，唯一一份，靠 JS 吸附到槽位） ---------- */
+.stage-slot{width:100%;max-width:var(--stage-max);margin:0 auto;aspect-ratio:4/3;border-radius:18px;background:#0a0f1e;border:1px solid var(--line)}
 #stage{
-  position:relative;width:min(94vw,880px);aspect-ratio:4/3;border-radius:18px;overflow:hidden;
+  position:absolute;left:0;top:0;width:min(94vw,880px);aspect-ratio:4/3;border-radius:18px;overflow:hidden;
   background:#0a0f1e;border:1px solid var(--line);
   box-shadow:0 24px 70px rgba(0,0,0,.55), 0 0 0 1px rgba(99,102,241,.06);
+  z-index:30;visibility:hidden;opacity:0;transition:opacity .18s;
 }
-#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}/* 画面镜像，符合自拍直觉 */
-#paint{position:absolute;inset:0;width:100%;height:100%}
+#stage.show{visibility:visible;opacity:1}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);transition:opacity .25s,filter .25s}
+#stage[data-view="challenge"] #cam{opacity:.34;filter:grayscale(.85) contrast(.92)}
+#paint{position:absolute;inset:0;width:100%;height:100%;z-index:1}
+#paintCh{position:absolute;inset:0;width:100%;height:100%;z-index:1;display:none}
+#stage[data-view="challenge"] #paint{display:none}
+#stage[data-view="challenge"] #paintCh{display:block}
+#traceCv{position:absolute;inset:0;width:100%;height:100%;z-index:2;opacity:0;transition:opacity .2s;pointer-events:none}
+#stage.tracing #traceCv{opacity:.26}
 
 /* 指尖光标：跟随食指尖端，样式随状态变化 */
 #cursor{
@@ -95,15 +239,15 @@ body{
 #noHandTip{
   position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:6;
   background:rgba(10,15,30,.72);backdrop-filter:blur(6px);border:1px solid var(--line);
-  color:var(--muted);font-size:12.5px;padding:6px 16px;border-radius:20px;display:none;
+  color:var(--muted);font-size:12.5px;padding:6px 16px;border-radius:20px;display:none;white-space:nowrap;
 }
 #noHandTip.show{display:block;animation:fadeIn .3s}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 
 /* ---------- 底部工具栏 ---------- */
-#toolbar{
-  width:min(94vw,880px);display:flex;flex-wrap:wrap;align-items:center;justify-content:center;
-  gap:10px 6px;padding:10px 12px;margin:12px 0 6px;border-radius:16px;
+.toolbar{
+  width:100%;max-width:var(--stage-max);margin:12px auto 0;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;
+  gap:10px 6px;padding:10px 12px;border-radius:16px;
   background:var(--panel);backdrop-filter:blur(12px);border:1px solid var(--line);
 }
 .tgroup{display:flex;align-items:center;gap:6px}
@@ -111,35 +255,151 @@ body{
 .tbtn{
   width:38px;height:38px;border-radius:11px;border:1px solid transparent;cursor:pointer;
   background:transparent;color:var(--muted);display:grid;place-items:center;
-  transition:all .18s;
+  transition:all .18s;font:inherit;
 }
 .tbtn:hover{background:rgba(148,163,184,.12);color:var(--text)}
 .tbtn:disabled{opacity:.3;cursor:not-allowed}
 .tbtn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 4px 16px rgba(99,102,241,.4)}
 .tbtn.confirm{background:var(--danger);color:#fff}
 .tbtn svg{width:18px;height:18px}
-.tbtn .lbl{display:none}
+.tbtn.wide{width:auto;display:inline-flex;align-items:center;gap:6px;padding:0 15px;font-size:12.5px;font-weight:600;color:var(--text)}
+.tbtn.wide.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 6px 18px rgba(99,102,241,.38)}
+.tbtn.wide svg{width:16px;height:16px}
 
 /* 色板 */
-#palette{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:center}
+.tgroup[data-palette]{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:center}
 .swatch{
   width:21px;height:21px;border-radius:50%;cursor:pointer;border:2px solid transparent;
-  transition:transform .15s, border-color .15s;
+  transition:transform .15s, border-color .15s;padding:0;
 }
 .swatch:hover{transform:scale(1.25)}
 .swatch.active{border-color:#fff;transform:scale(1.3);box-shadow:0 0 8px rgba(255,255,255,.35)}
 
 /* 粗细滑块 */
-#sizeGroup{gap:9px}
-#sizeSlider{width:110px;accent-color:var(--accent);cursor:pointer}
-#sizeLabel{font-size:12px;color:var(--muted);min-width:38px;font-variant-numeric:tabular-nums}
+.size-group{gap:9px}
+.size-range{width:104px;accent-color:var(--accent);cursor:pointer}
+.size-label{font-size:12px;color:var(--muted);min-width:38px;font-variant-numeric:tabular-nums}
+
+/* ---------- 模仿挑战 ---------- */
+.ch-grid{display:grid;grid-template-columns:minmax(250px,.74fr) minmax(0,1fr);gap:16px;align-items:start}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px}
+.ref-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px}
+.pane-title{font-size:13px;font-weight:600;letter-spacing:.5px}
+.level-tag{font-size:11px;padding:3px 9px;border-radius:20px;color:#c7d2fe;background:rgba(99,102,241,.14);border:1px solid rgba(99,102,241,.4);white-space:nowrap}
+#refCv{width:100%;display:block;border-radius:12px;background:#0a1122;border:1px solid var(--line)}
+.ch-chips{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 10px}
+.chip{
+  font:inherit;font-size:12px;padding:6px 11px;border-radius:9px;cursor:pointer;color:var(--muted);
+  background:rgba(148,163,184,.08);border:1px solid transparent;transition:all .15s;
+}
+.chip:hover{color:var(--text)}
+.chip.active{color:#fff;background:rgba(99,102,241,.28);border-color:rgba(99,102,241,.6)}
+.ch-hint{font-size:11.5px;color:var(--muted);line-height:1.7;margin-top:10px}
+.ch-hint b{color:#c7d2fe;font-weight:600}
+
+/* 开关 */
+.switch{display:flex;align-items:center;gap:9px;cursor:pointer;font-size:12px;color:var(--muted);line-height:1.5}
+.switch input{display:none}
+.switch .track{width:34px;height:19px;border-radius:20px;background:rgba(148,163,184,.25);position:relative;transition:background .2s;flex:none}
+.switch .knob{position:absolute;left:2px;top:2px;width:15px;height:15px;border-radius:50%;background:#fff;transition:transform .2s}
+.switch input:checked + .track{background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.switch input:checked + .track .knob{transform:translateX(15px)}
+
+/* ---------- 画廊 ---------- */
+.gal-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:8px 2px 16px}
+.gal-head h2{font-size:22px;letter-spacing:1.5px}
+.gal-head p{font-size:12px;color:var(--muted);margin-top:5px}
+.gal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
+.gal-item{margin:0;border-radius:16px;overflow:hidden;background:var(--panel);border:1px solid var(--line);cursor:pointer;transition:transform .2s,border-color .2s;position:relative}
+.gal-item:hover{transform:translateY(-3px);border-color:rgba(99,102,241,.45)}
+.gal-thumb{aspect-ratio:4/3;background:#0a0f1e;overflow:hidden}
+.gal-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.gal-item figcaption{padding:9px 11px 11px;display:flex;flex-direction:column;gap:3px}
+.gal-title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gal-meta{font-size:11px;color:var(--muted)}
+.gal-badge{position:absolute;top:8px;right:8px;font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;color:#06121f;background:#22c55e}
+.gal-badge[data-lv="mid"]{background:#facc15}
+.gal-badge[data-lv="low"]{background:#cbd5e1}
+.empty-state{display:none;flex-direction:column;align-items:center;gap:13px;padding:64px 20px;color:var(--muted)}
+.empty-state.show{display:flex}
+.empty-ico{font-size:44px;opacity:.65}
+.empty-state p{font-size:13.5px}
+
+/* 通用按钮 */
+.btn{
+  font:inherit;font-size:13px;padding:9px 18px;border-radius:11px;cursor:pointer;
+  color:var(--text);background:rgba(148,163,184,.1);border:1px solid var(--line);transition:all .18s;
+}
+.btn:hover{background:rgba(148,163,184,.18);border-color:rgba(148,163,184,.3)}
+.btn.primary{color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent;box-shadow:0 8px 22px rgba(99,102,241,.35)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost-danger{color:#fca5a5;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
+.btn.ghost-danger.confirm{background:var(--danger);color:#fff;border-color:var(--danger)}
+
+/* ---------- 弹层（评分结果 / 灯箱） ---------- */
+.modal{position:fixed;inset:0;z-index:150;display:none;align-items:center;justify-content:center;background:rgba(2,6,16,.8);backdrop-filter:blur(8px)}
+.modal.show{display:flex;animation:fadeIn .2s}
+.score-card{
+  position:relative;width:min(94vw,600px);max-height:92vh;overflow:auto;
+  background:linear-gradient(160deg,#141d33,#0c1322);border:1px solid rgba(148,163,184,.2);
+  border-radius:22px;padding:26px 28px 24px;box-shadow:0 30px 90px rgba(0,0,0,.6);
+}
+.modal-x{
+  position:absolute;top:14px;right:14px;width:30px;height:30px;border-radius:9px;cursor:pointer;
+  background:rgba(148,163,184,.12);border:1px solid var(--line);color:var(--muted);font:inherit;font-size:14px;
+}
+.modal-x:hover{color:#fff;background:rgba(148,163,184,.22)}
+.score-top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;padding-right:34px}
+.score-label{font-size:11.5px;color:var(--muted);letter-spacing:1px;margin-bottom:6px}
+.score-big{
+  font-size:62px;font-weight:800;line-height:.95;letter-spacing:-2px;
+  background:linear-gradient(135deg,#fff,#a5b4fc 60%,#a855f7);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.score-big small{font-size:17px;font-weight:600;margin-left:6px;letter-spacing:0}
+.score-side{text-align:right;min-width:150px;flex:1}
+.score-grade{font-size:19px;font-weight:700;letter-spacing:1px;color:#a5b4fc}
+.score-tip{font-size:12px;color:var(--muted);line-height:1.7;margin-top:7px}
+.score-metrics{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 14px}
+.score-metrics div{flex:1;min-width:96px;background:rgba(148,163,184,.07);border:1px solid var(--line);border-radius:11px;padding:9px 12px;display:flex;flex-direction:column;gap:4px}
+.score-metrics span{font-size:11px;color:var(--muted)}
+.score-metrics b{font-size:13.5px;font-weight:600}
+.tri-wrap{border-radius:14px;overflow:hidden;border:1px solid var(--line);background:#080c1a}
+#triCv{width:100%;display:block}
+.tri-legend{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0 16px;font-size:11.5px;color:var(--muted)}
+.tri-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.dot.d-ref{background:var(--ref)} .dot.d-mine{background:var(--mine)} .dot.d-both{background:var(--both)}
+.score-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+
+/* 灯箱 */
+#lightbox{position:fixed;inset:0;z-index:180;display:none;background:rgba(2,6,16,.93);backdrop-filter:blur(4px)}
+#lightbox.show{display:block}
+.lb-bar{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;z-index:3;background:linear-gradient(to bottom,rgba(2,6,16,.85),transparent)}
+.lb-info{display:flex;flex-direction:column;gap:3px;min-width:0}
+#lbTitle{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lbInfo{font-size:12px;color:var(--muted)}
+.lb-tools{display:flex;align-items:center;gap:8px;flex:none}
+#lbCounter{font-size:12px;color:var(--muted);margin-right:4px;font-variant-numeric:tabular-nums}
+.icon-btn{font:inherit;font-size:12.5px;padding:7px 13px;border-radius:9px;cursor:pointer;color:var(--text);background:rgba(148,163,184,.12);border:1px solid var(--line);transition:all .18s}
+.icon-btn:hover{background:rgba(148,163,184,.22)}
+.icon-btn.confirm{background:var(--danger);border-color:var(--danger);color:#fff}
+.lb-stage{position:absolute;inset:68px 26px 26px;display:flex;align-items:center;justify-content:center}
+#lbImg{max-width:100%;max-height:100%;border-radius:12px;box-shadow:0 24px 70px rgba(0,0,0,.65);background:#0b1120}
+.lb-nav{
+  position:absolute;top:50%;transform:translateY(-50%);width:44px;height:68px;border-radius:12px;cursor:pointer;
+  background:rgba(148,163,184,.12);border:1px solid var(--line);color:#e2e8f0;font-size:26px;line-height:1;
+  display:grid;place-items:center;z-index:3;transition:all .18s;
+}
+.lb-nav:hover{background:rgba(148,163,184,.24)}
+.lb-nav:disabled{opacity:.25;cursor:not-allowed}
+.lb-nav.prev{left:12px} .lb-nav.next{right:12px}
 
 /* ---------- Toast 提示 ---------- */
-#toasts{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center}
+#toasts{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
 .toast{
-  background:rgba(15,21,38,.92);border:1px solid var(--line);color:var(--text);
+  background:rgba(15,21,38,.94);border:1px solid var(--line);color:var(--text);
   font-size:13px;padding:9px 20px;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.4);
-  animation:toastIn .25s ease-out;
+  animation:toastIn .25s ease-out;max-width:86vw;text-align:center;line-height:1.6;
 }
 .toast.warn{border-color:rgba(245,158,11,.4)} .toast.err{border-color:rgba(239,68,68,.4)}
 .toast.out{animation:toastOut .3s forwards}
@@ -148,7 +408,7 @@ body{
 
 /* ---------- 启动页 / 加载页 / 错误页 覆盖层 ---------- */
 #overlay{
-  position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;
+  position:fixed;inset:0;z-index:120;display:flex;align-items:center;justify-content:center;
   background:radial-gradient(900px 600px at 70% -10%,#1b2547 0%,#0a0f1e 60%);
   transition:opacity .4s;
 }
@@ -166,7 +426,6 @@ body{
 .card .sub{color:var(--muted);font-size:13.5px;margin:8px 0 22px;line-height:1.7}
 .card .sub b{color:var(--text);font-weight:600}
 
-/* 手势教程卡片 */
 #gestures{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:10px;margin-bottom:18px}
 .gcard{
   background:rgba(148,163,184,.06);border:1px solid var(--line);border-radius:14px;
@@ -180,12 +439,11 @@ body{
 .privacy{font-size:11.5px;color:var(--muted);margin-bottom:22px;line-height:1.7}
 .privacy b{color:var(--warn)}
 
-/* 启动 / 加载中 按钮 */
 #startBtn{
   padding:13px 52px;font-size:16px;font-weight:600;letter-spacing:2px;cursor:pointer;
   color:#fff;border:none;border-radius:14px;
   background:linear-gradient(135deg,var(--accent),var(--accent2));
-  box-shadow:0 10px 30px rgba(99,102,241,.45);transition:all .2s;
+  box-shadow:0 10px 30px rgba(99,102,241,.45);transition:all .2s;font-family:inherit;
 }
 #startBtn:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(99,102,241,.6)}
 #startBtn:active{transform:none}
@@ -201,20 +459,39 @@ body{
 #loadText{font-size:14px;color:var(--text)}
 #loadSub{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.7}
 
-/* 错误卡片 */
 #errorBox{display:none}
 #errorBox.show{display:block}
 #errorBox h2{font-size:18px;color:var(--danger);margin-bottom:10px}
 #errorBox p{font-size:13px;color:var(--muted);line-height:1.8;margin-bottom:6px;white-space:pre-line}
 #retryBtn{
   margin-top:14px;padding:10px 34px;border-radius:12px;cursor:pointer;font-size:14px;
-  background:transparent;color:var(--text);border:1px solid var(--line);transition:all .2s;
+  background:transparent;color:var(--text);border:1px solid var(--line);transition:all .2s;font-family:inherit;
 }
 #retryBtn:hover{border-color:var(--accent);color:var(--accent)}
 
+/* ---------- 响应式 ---------- */
+@media (max-width:880px){
+  .home-hero{flex-direction:column;align-items:flex-start;padding:30px 26px;min-height:auto;gap:18px}
+  .hero-copy h2{font-size:32px}
+  .hero-art{width:100%;max-width:none;height:130px;display:flex;align-items:center;justify-content:center}
+  .hero-art svg{height:130px;width:auto}
+  .hero-tip{bottom:0}
+  .home-mini{grid-template-columns:1fr}
+  .ch-grid{grid-template-columns:1fr}
+  .score-side{text-align:left}
+}
 @media (max-width:640px){
   .sep{display:none}
-  #toolbar{gap:8px}
+  .toolbar{gap:8px 4px;padding:9px 8px}
+  .tbtn{width:34px;height:34px}
+  .tbtn.wide{padding:0 10px;font-size:12px}
+  .size-range{width:78px}
+  .logo small{display:none}
+  .score-card{padding:20px 18px}
+  .score-big{font-size:52px}
+  .lb-stage{inset:60px 10px 14px}
+  .lb-nav{width:34px;height:54px;font-size:20px}
+  .lb-nav.prev{left:4px} .lb-nav.next{right:4px}
 }
 </style>
 </head>
@@ -222,64 +499,208 @@ body{
 
 <!-- ================= 模块 1：页面结构 ================= -->
 <header id="topbar">
-  <div class="logo"><span class="dot"></span>空中画板 <small>Air Canvas · 手势隔空绘画</small></div>
+  <div class="top-left">
+    <button id="btnBack" title="返回首页">← 首页</button>
+    <div class="logo"><span class="dot"></span>空中画板 <small id="viewTitle">手势隔空绘画</small></div>
+  </div>
   <div class="top-right">
     <span id="fps">-- FPS</span>
     <span id="stateBadge" class="s-idle">未启动</span>
+    <div id="userBox">
+      <span id="userName"></span>
+      <button class="auth-btn ghost show" id="btnLogout">退出</button>
+    </div>
+    <button class="auth-btn" id="btnAuth">登录 / 注册</button>
   </div>
 </header>
 
-<main id="stage">
-  <video id="cam" autoplay muted playsinline></video>
-  <canvas id="paint" width="640" height="480"></canvas>
-  <div id="cursor"></div>
-  <div id="noHandTip">未检测到手 · 请将手伸到镜头前</div>
-</main>
+<div id="views">
 
-<footer id="toolbar">
-  <div class="tgroup" id="modeGroup">
-    <button class="tbtn active" id="btnPen" title="画笔模式（伸食指绘制）">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4L7 21H3v-4L17 3z"/></svg>
-    </button>
-    <button class="tbtn" id="btnEraser" title="橡皮擦（或握拳保持1秒切换）">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><path d="M5 13l8-8 5 5-7 7H7l-2-2v-2z"/></svg>
-    </button>
+  <!-- ---------- 首页 ---------- -->
+  <section class="view" id="view-home" data-view="home">
+    <div class="home-hero" id="homeHero">
+      <div class="hero-copy">
+        <span class="hero-flag">主打功能 · 手势隔空绘画</span>
+        <h2>自由画板</h2>
+        <p>伸出食指，空气就是画布。笔迹跟着指尖走，握拳抬笔停顿，握拳保持一秒切换橡皮擦，张开手掌停止待机。</p>
+        <ul class="hero-points">
+          <li>10 种颜色</li><li>粗细 2–30 px</li><li>撤销 / 重做</li><li>一键存入画廊</li>
+        </ul>
+        <span class="hero-cta" id="homeHeroBtn">进入画板 →</span>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <svg viewBox="0 0 320 240">
+          <defs>
+            <linearGradient id="heroGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#818cf8"/>
+              <stop offset=".5" stop-color="#a855f7"/>
+              <stop offset="1" stop-color="#22d3ee"/>
+            </linearGradient>
+          </defs>
+          <path class="hero-stroke" d="M38 176 C 74 96, 112 196, 152 126 S 226 58, 286 112"
+                fill="none" stroke="url(#heroGrad)" stroke-width="6" stroke-linecap="round"/>
+          <path class="hero-stroke s2" d="M58 208 C 106 168, 148 214, 198 180 S 258 152, 300 184"
+                fill="none" stroke="url(#heroGrad)" stroke-width="4" stroke-linecap="round"/>
+        </svg>
+        <span class="hero-tip">✋ 隔空作画</span>
+      </div>
+    </div>
+
+    <div class="home-mini">
+      <button class="mini-card" id="tileChallenge">
+        <span class="mini-ico">🎯</span>
+        <span class="mini-text"><b>模仿挑战</b><em>照着线稿画，看能得多少分</em></span>
+        <span class="mini-arrow">→</span>
+      </button>
+      <button class="mini-card" id="tileGallery">
+        <span class="mini-ico">🖼️</span>
+        <span class="mini-text"><b>我的画廊</b><em id="galCountText">还没有作品</em></span>
+        <img id="galLatest" class="mini-thumb" alt="">
+        <span class="mini-arrow">→</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- ---------- 自由画板 ---------- -->
+  <section class="view" id="view-free" data-view="free">
+    <div class="stage-slot" id="slotFree"></div>
+    <footer class="toolbar" id="toolbarFree"></footer>
+  </section>
+
+  <!-- ---------- 模仿挑战 ---------- -->
+  <section class="view" id="view-challenge" data-view="challenge">
+    <div class="ch-grid">
+      <div class="pane">
+        <div class="ref-head">
+          <span class="pane-title">照着画</span>
+          <span class="level-tag" id="chLevel">简单</span>
+        </div>
+        <canvas id="refCv" width="800" height="600"></canvas>
+        <div class="ch-chips" id="chChips"></div>
+        <label class="switch">
+          <input type="checkbox" id="traceToggle">
+          <span class="track"><span class="knob"></span></span>
+          <span>描摹模式（参考图淡淡压在画布上）</span>
+        </label>
+        <p class="ch-hint">画完点右下角 <b>「提交评分」</b>。评分会忽略颜色，只比较线条位置和覆盖程度；建议画笔粗细调到 <b>6–10 px</b>。</p>
+      </div>
+      <div>
+        <div class="stage-slot" id="slotCh"></div>
+        <footer class="toolbar" id="toolbarCh"></footer>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------- 我的画廊 ---------- -->
+  <section class="view" id="view-gallery" data-view="gallery">
+    <div class="gal-head">
+      <div>
+        <h2>我的画廊</h2>
+        <p id="galUsage">0 / 40 张</p>
+      </div>
+      <button class="btn ghost-danger" id="btnGalClearAll">清空全部</button>
+    </div>
+    <div class="gal-grid" id="galGrid"></div>
+    <div class="empty-state" id="galEmpty">
+      <div class="empty-ico">🖼️</div>
+      <p>画廊还是空的，去画一张吧</p>
+      <button class="btn primary" id="emptyGoDraw">去自由画板创作</button>
+    </div>
+  </section>
+
+  <!-- ---------- 唯一的舞台：不搬家，靠 JS 吸附到槽位 ---------- -->
+  <div id="stage">
+    <video id="cam" autoplay muted playsinline></video>
+    <canvas id="paint" width="640" height="480"></canvas>
+    <canvas id="paintCh" width="640" height="480"></canvas>
+    <canvas id="traceCv" width="400" height="300"></canvas>
+    <div id="cursor"></div>
+    <div id="noHandTip">未检测到手 · 请将手伸到镜头前</div>
   </div>
-  <div class="sep"></div>
-  <div class="tgroup" id="palette"><!-- 色板由 JS 生成 --></div>
-  <div class="sep"></div>
-  <div class="tgroup" id="sizeGroup">
-    <input type="range" id="sizeSlider" min="2" max="30" step="1" value="6" title="画笔粗细">
-    <span id="sizeLabel">6 px</span>
-  </div>
-  <div class="sep"></div>
-  <div class="tgroup">
-    <button class="tbtn" id="btnUndo" title="撤销 (Ctrl+Z)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10h10a5 5 0 015 5v1"/><path d="M3 10l4-4"/><path d="M3 10l4 4"/></svg>
-    </button>
-    <button class="tbtn" id="btnRedo" title="重做 (Ctrl+Y)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10H11a5 5 0 00-5 5v1"/><path d="M21 10l-4-4"/><path d="M21 10l-4 4"/></svg>
-    </button>
-    <button class="tbtn" id="btnClear" title="清空画布（点两次确认）">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>
-    </button>
-  </div>
-  <div class="sep"></div>
-  <div class="tgroup">
-    <button class="tbtn" id="btnPause" title="暂停 / 恢复追踪">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5v14"/><path d="M14 5v14"/></svg>
-    </button>
-    <button class="tbtn" id="btnSave" title="保存为 PNG 图片">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
-    </button>
-  </div>
-</footer>
+</div>
 
 <div id="toasts"></div>
 
+<!-- 评分结果 -->
+<div class="modal" id="scoreModal">
+  <div class="score-card">
+    <button class="modal-x" id="scoreClose">✕</button>
+    <div class="score-top">
+      <div>
+        <div class="score-label">本 次 相 似 度</div>
+        <div class="score-big"><span id="scoreNum">0</span><small>分</small></div>
+      </div>
+      <div class="score-side">
+        <div class="score-grade" id="scoreGrade">—</div>
+        <div class="score-tip" id="scoreTip"></div>
+      </div>
+    </div>
+    <div class="score-metrics">
+      <div><span>题目</span><b id="scoreName">—</b></div>
+      <div><span>平均偏差</span><b id="mDev">—</b></div>
+      <div><span>覆盖率</span><b id="mCov">—</b></div>
+    </div>
+    <div class="tri-wrap"><canvas id="triCv" width="720" height="540"></canvas></div>
+    <div class="tri-legend">
+      <span><i class="dot d-ref"></i>参考线稿</span>
+      <span><i class="dot d-mine"></i>你的笔迹</span>
+      <span><i class="dot d-both"></i>重合部分</span>
+    </div>
+    <div class="score-actions">
+      <button class="btn primary" id="btnScoreSave">保存到画廊</button>
+      <button class="btn" id="btnScoreRetry">清空重画</button>
+      <button class="btn" id="btnScoreNext">换一幅</button>
+    </div>
+  </div>
+</div>
+
+<!-- 画廊灯箱 -->
+<div id="lightbox">
+  <div class="lb-bar">
+    <div class="lb-info">
+      <span id="lbTitle">—</span>
+      <small id="lbInfo">—</small>
+    </div>
+    <div class="lb-tools">
+      <span id="lbCounter"></span>
+      <button class="icon-btn" id="lbDownload">下载</button>
+      <button class="icon-btn" id="lbDelete">删除</button>
+      <button class="icon-btn" id="lbClose">✕</button>
+    </div>
+  </div>
+  <button class="lb-nav prev" id="lbPrev">‹</button>
+  <div class="lb-stage"><img id="lbImg" alt="作品预览"></div>
+  <button class="lb-nav next" id="lbNext">›</button>
+</div>
+
+<!-- 登录 / 注册 -->
+<div id="authModal">
+  <div class="auth-card">
+    <button class="modal-x" id="authClose">✕</button>
+    <h3 id="authTitle">登录账号</h3>
+    <p class="auth-sub" id="authSub">登录后作品会存到云端，换一台电脑登录同一个账号，画廊里还是这些画。</p>
+    <div class="auth-error" id="authError"></div>
+    <div class="auth-field">
+      <label for="authUser">用户名</label>
+      <input id="authUser" type="text" autocomplete="username" maxlength="20" spellcheck="false" placeholder="2–20 位字母、数字或下划线">
+    </div>
+    <div class="auth-field">
+      <label for="authPass">密码</label>
+      <input id="authPass" type="password" autocomplete="current-password" maxlength="72" placeholder="至少 6 位">
+    </div>
+    <div class="auth-actions">
+      <button class="btn" id="authCancel">取消</button>
+      <button class="btn primary" id="authSubmit">登录</button>
+    </div>
+    <p class="auth-switch" id="authSwitchRow">
+      <span id="authSwitchText">还没有账号？</span><b id="authSwitchBtn">立即注册</b>
+    </p>
+    <p class="auth-note">密码由你自己保管，站点没有找回密码功能。作品仅账号本人可见。</p>
+  </div>
+</div>
+
 <!-- 启动 / 加载 / 错误 覆盖层 -->
 <div id="overlay">
-  <!-- 启动页：手势教程 + 权限引导 -->
   <div class="card" id="startBox">
     <h1>空中画板</h1>
     <p class="sub">基于 <b>MediaPipe Hands 手部追踪</b> 的隔空绘画网页<br>食指即是画笔，镜头前的空气就是画布</p>
@@ -293,14 +714,12 @@ body{
     <button id="startBtn">启 动 体 验</button>
   </div>
 
-  <!-- 加载页：分步进度提示，避免"卡住无反馈" -->
   <div class="card" id="loadingBox">
     <div class="spinner"></div>
     <div id="loadText">正在开启摄像头…</div>
     <div id="loadSub">如果浏览器弹出权限询问，请选择「允许」</div>
   </div>
 
-  <!-- 错误页：分类提示 + 重试 -->
   <div class="card" id="errorBox">
     <h2 id="errTitle">出错了</h2>
     <p id="errMsg"></p>
@@ -319,9 +738,24 @@ const CONFIG = {
   STABLE_FRAMES: 4,       // 手势稳定器：连续 N 帧一致才确认切换（防抖动误触发）
   FIST_HOLD_MS: 1000,     // 握拳保持时长 → 切换 画笔/橡皮擦
   NOHAND_MS: 1500,        // 手离开画面多久进入待机
-  HISTORY_MAX: 25,        // 撤销栈上限（640×480×4B ≈ 1.2MB/张，25 张约 30MB）
+  HISTORY_MAX: 25,        // 自由画板撤销栈上限（640×480×4B ≈ 1.2MB/张）
+  CH_HISTORY_MAX: 10,     // 挑战画布只留 10 张，省内存
   // One Euro 滤波参数：低速强滤波去抖、高速弱滤波保流畅（假设 30fps）
   EURO: { minCutoff: 1.2, beta: 0.007, dCutoff: 1.0 },
+  // 评分：掩膜 240×180（与 640×480 同 4:3，缩放比 0.375）
+  // tauPx：精确度衰减尺度，单位是掩膜像素（1 掩膜像素 ≈ 2.67 画布像素）
+  // fullCoverage：覆盖率达到该值才算"画完整"，低于它按比例扣分
+  SCORE: { W: 240, H: 180, inkAlpha: 40, refAlpha: 24, tauPx: 30, fullCoverage: 0.85, maxCoverage: 2.5, nearTol: 2 },
+  // 画廊：localStorage 单键存储，容量估算见模块 14 注释
+  GALLERY: { KEY: 'aircanvas.gallery.v1', MAX: 40, FULL_Q: 0.72, THUMB_Q: 0.70, THUMB_W: 240, THUMB_H: 180 },
+  // Supabase 账号与云端画廊：把下面两项填上才会启用；留空则保持纯本地模式，其它功能不受影响
+  SUPABASE: {
+    URL: 'https://ocqqmnedssmafuongccr.supabase.co',
+    ANON_KEY: 'sb_publishable_2ETDpvsHQtYtbgmgzepW0A_M555qb4o',  // 可发布密钥（publishable），可安全放前端
+    BUCKET: 'artworks',            // Storage 桶名（与 SQL 脚本里保持一致）
+    EMAIL_DOMAIN: 'aircanvas.app', // 用户名会被拼成 username@artcanvas.app 作为登录标识
+    MAX: 200                       // 云端作品上限（仅用于界面提示）
+  },
   // MediaPipe Hands 版本与 CDN 多源容错列表
   HANDS_VER: '0.4.1675469240',
   get CDN_BASES() {
@@ -340,7 +774,6 @@ const state = {
   tool: 'pen',          // pen | eraser（当前工具，可用工具栏或握拳保持1秒切换）
   color: '#ffffff',
   penSize: 6,
-  running: false,       // 暂停按钮控制的追踪开关
   lastHandTime: 0,      // 最近一次检测到手的时间戳
   fistHoldStart: 0,     // 握拳开始时间（用于 1 秒计时）
   fistHoldFired: false, // 本次握拳是否已触发过工具切换
@@ -349,6 +782,9 @@ const state = {
 /* DOM 引用集中管理 */
 const $ = id => document.getElementById(id);
 const video = $('cam'), paintCv = $('paint'), pctx = paintCv.getContext('2d', { willReadFrequently: true });
+const chCv = $('paintCh'), chCtx = chCv.getContext('2d', { willReadFrequently: true });
+const traceCv = $('traceCv'), tctx = traceCv.getContext('2d');
+const stageEl = $('stage'), viewsEl = $('views');
 const cursorEl = $('cursor'), badgeEl = $('stateBadge'), fpsEl = $('fps'), noHandTip = $('noHandTip');
 
 /* ============================================================
@@ -373,7 +809,7 @@ async function loadHandsLibrary() {
   for (const base of CONFIG.CDN_BASES) {
     try {
       await loadScriptOnce(base + '/hands.js');
-      if (typeof window.Hands === 'function') return base; // 加载成功且全局对象可用
+      if (typeof window.Hands === 'function') return base;
     } catch (e) { /* 换下一个源 */ }
   }
   throw new Error('所有 CDN 均不可用');
@@ -387,10 +823,15 @@ async function loadHandsLibrary() {
  *   3. 按错误类型给出针对性提示（权限拒绝 / 无设备 / 被占用）。
  * ============================================================ */
 async function startCamera() {
-  // 安全上下文检测：部分浏览器在 file:// 下直接不暴露摄像头 API
+  // 预览面板 / 内嵌窗口里打开时，页面处于沙箱环境，浏览器一律拒绝摄像头
+  if (window.top !== window.self) {
+    const e = new Error('Invalid security origin（页面被嵌在预览面板里）');
+    e.tip = '这个页面现在是在预览面板里打开的，浏览器不允许内嵌页面调用摄像头。\n请把地址 http://127.0.0.1:8765/index.html 复制到 Chrome 或 Edge 的地址栏，单独开一个标签页再点启动。';
+    throw e;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     const e = new Error('当前浏览器在此打开方式下无法访问摄像头');
-    e.tip = '请改用 Chrome 或 Edge 直接双击打开本文件；\n若仍不行，可按 README 说明启动本地服务器后访问 localhost。';
+    e.tip = '请改用 Chrome 或 Edge 打开 http://127.0.0.1:8765/index.html；\n若仍不行，可按 README 说明启动本地服务器后访问 localhost。';
     throw e;
   }
   let stream;
@@ -400,18 +841,22 @@ async function startCamera() {
       audio: false
     });
   } catch (err) {
-    // 按错误类型给出可操作的解决建议
-    const map = {
-      NotAllowedError: '摄像头权限被拒绝。请点击地址栏左侧的相机/锁形图标，将摄像头设为「允许」后刷新页面重试。',
-      NotFoundError: '未检测到摄像头设备。请确认电脑已连接摄像头并启用。',
-      NotReadableError: '摄像头被其他程序占用（如腾讯会议 / Zoom 等）。请关闭占用程序后重试。'
-    };
-    err.tip = map[err.name] || ('摄像头打开失败：' + (err.message || err.name));
+    const m = err.message || '';
+    if (/security origin|not allowed by policy|permission denied by system/i.test(m)) {
+      err.tip = '浏览器判定当前打开方式不安全，拒绝调用摄像头。\n请把地址复制到 Chrome / Edge 地址栏单独打开：http://127.0.0.1:8765/index.html';
+    } else {
+      const map = {
+        NotAllowedError: '摄像头权限被拒绝。请点击地址栏左侧的相机/锁形图标，将摄像头设为「允许」后刷新页面重试。',
+        NotFoundError: '未检测到摄像头设备。请确认电脑已连接摄像头并启用。',
+        NotReadableError: '摄像头被其他程序占用（如腾讯会议 / Zoom 等）。请关闭占用程序后重试。'
+      };
+      err.tip = map[err.name] || ('摄像头打开失败：' + (m || err.name));
+    }
     throw err;
   }
   video.srcObject = stream;
-  await video.play();                 // muted+autoplay 环境下 play() 不会被策略拦截
-  await new Promise(r => {             // 等待第一帧就绪，避免黑帧送入模型
+  await video.play();
+  await new Promise(r => {
     if (video.readyState >= 2) return r();
     video.onloadeddata = () => r();
   });
@@ -421,23 +866,18 @@ async function startCamera() {
  * 模块 5：手势识别器
  * MediaPipe Hands 输出 21 个手部关键点（归一化坐标）。
  * 关键点索引：0手腕 4拇指尖 8食指尖 12中指尖 16无名指尖 20小指尖
- *             5/9/13/17 分别为四指根部关节
  *
  * 判定思路（对远近、手掌大小不敏感）：
- *   - 掌宽参考 = dist(手腕0, 中指根9)，用于拇指判定归一化；
- *   - 四指伸直：指尖到手腕的距离 > (PIP关节到手腕距离 × 1.12)
- *     （弯曲时指尖向掌心收拢，距手腕变近）；
- *   - 拇指伸直：拇指尖到中指根距离 > 掌宽 × 0.7
- *     （握拳时拇指横贴在四指上，距离显著变小）。
- * 稳定器：连续 STABLE_FRAMES 帧判定一致才切换确认手势，
- *         消除单帧抖动造成的误触发。
+ *   - 掌宽参考 = dist(手腕0, 中指根9)；
+ *   - 四指伸直：指尖到手腕的距离 > (PIP关节到手腕距离 × 1.12)；
+ *   - 拇指伸直：拇指尖到中指根距离 > 掌宽 × 0.7。
+ * 稳定器：连续 STABLE_FRAMES 帧判定一致才切换确认手势。
  * ============================================================ */
 function dist2d(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return Math.hypot(dx, dy); }
 
-/** 由 21 个关键点判定每根手指的伸直状态 */
 function fingerStates(lm) {
   const wrist = lm[0];
-  const palm = dist2d(lm[0], lm[9]) || 1e-6; // 掌宽参考值（防除零）
+  const palm = dist2d(lm[0], lm[9]) || 1e-6;
   const ext = (tip, pip) => dist2d(lm[tip], wrist) > dist2d(lm[pip], wrist) * 1.12;
   return {
     index:  ext(8, 6),
@@ -448,15 +888,13 @@ function fingerStates(lm) {
   };
 }
 
-/** 将手指状态归类为四种手势之一 */
 function classifyGesture(f) {
-  if (f.index && !f.middle && !f.ring && !f.pinky) return 'INDEX';   // 只伸食指 → 绘制
-  if (!f.index && !f.middle && !f.ring && !f.pinky && !f.thumb) return 'FIST'; // 握拳 → 暂停
-  if (f.index && f.middle && f.ring && f.pinky && f.thumb) return 'PALM';      // 张开手掌 → 停止
-  return 'OTHER';                                                    // 其他 → 抬笔悬停
+  if (f.index && !f.middle && !f.ring && !f.pinky) return 'INDEX';
+  if (!f.index && !f.middle && !f.ring && !f.pinky && !f.thumb) return 'FIST';
+  if (f.index && f.middle && f.ring && f.pinky && f.thumb) return 'PALM';
+  return 'OTHER';
 }
 
-/** 手势稳定器：连续 N 帧一致才确认，防止边界抖动 */
 const stabilizer = {
   lastRaw: null, count: 0, stable: null,
   feed(raw) {
@@ -476,18 +914,16 @@ const stabilizer = {
  *   PAUSE --握拳保持1s--> 切换工具(画笔/橡皮擦)
  *   PAUSE --食指--> DRAW/ERASE    任意 --张开手掌--> STOP
  *   STOP  --食指--> DRAW         任意 --手离开1.5s--> IDLE
- *   任意 --其他手势--> PAUSE(仅抬笔，不改状态徽章)
+ *   draw 是"当前活动引擎"的指针，本模块不关心画在哪块画布上。
  * ============================================================ */
 function setState(next) {
   if (state.phase === next) return;
-  if (state.phase === 'DRAW' || state.phase === 'ERASE') draw.endStroke(); // 离开绘制状态必须抬笔
+  if (state.phase === 'DRAW' || state.phase === 'ERASE') draw.endStroke();
   state.phase = next;
   updateBadge();
 }
 
-/** 每帧驱动状态机；返回当前是否处于"笔在纸上"的绘制状态 */
 function stepStateMachine(gesture, hasHand, now) {
-  // --- 无手 1.5 秒 → 待机 ---
   if (!hasHand) {
     if (state.phase !== 'IDLE' && now - state.lastHandTime > CONFIG.NOHAND_MS) setState('IDLE');
     return false;
@@ -496,14 +932,12 @@ function stepStateMachine(gesture, hasHand, now) {
 
   switch (gesture) {
     case 'INDEX': {
-      // 伸食指：按当前工具进入对应绘制状态
       const target = state.tool === 'eraser' ? 'ERASE' : 'DRAW';
       setState(target);
-      return state.phase === target; // 只有刚进入（或已处于）绘制状态才落笔
+      return state.phase === target;
     }
     case 'FIST': {
       setState('PAUSE');
-      // 握拳计时：持续 1 秒 → 切换画笔/橡皮擦（可来回切换）
       if (!state.fistHoldStart) { state.fistHoldStart = now; state.fistHoldFired = false; }
       else if (!state.fistHoldFired && now - state.fistHoldStart >= CONFIG.FIST_HOLD_MS) {
         state.fistHoldFired = true;
@@ -511,8 +945,8 @@ function stepStateMachine(gesture, hasHand, now) {
       }
       return false;
     }
-    case 'PALM': setState('STOP'); return false;   // 张开手掌 → 停止待机
-    default:                                     // OTHER：其他手势一律抬笔，进入暂停态
+    case 'PALM': setState('STOP'); return false;
+    default:
       setState('PAUSE');
       draw.endStroke();
       return false;
@@ -525,7 +959,6 @@ function stepStateMachine(gesture, hasHand, now) {
  *   指尖移动慢 → 截止频率低 → 滤波强 → 消除手抖；
  *   指尖移动快 → 截止频率高 → 滤波弱 → 保留快速挥笔的流畅轨迹。
  * 论文：Casiez et al., "1€ Filter", CHI 2012
- * x、y 两个维度分别独立滤波。
  * ============================================================ */
 class LowPass {
   constructor() { this.y = null; }
@@ -540,22 +973,18 @@ class OneEuroFilter {
     this.tPrev = null; this.xPrev = 0;
   }
   reset() { this.xF.reset(); this.dxF.reset(); this.tPrev = null; }
-  /** 滤波器的平滑系数：截止频率越低（tau 越大）α 越小 → 平滑越强 */
   alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
   filter(x, tMs) {
     if (this.tPrev === null) { this.tPrev = tMs; this.xPrev = x; this.xF.reset(); return x; }
-    const dt = Math.max((tMs - this.tPrev) / 1000, 1e-3); // 秒，防除零
+    const dt = Math.max((tMs - this.tPrev) / 1000, 1e-3);
     this.tPrev = tMs;
-    // 估计速度并对其做低通（抑制噪声引起的伪速度）
     const dx = (x - this.xPrev) / dt; this.xPrev = x;
     const edx = this.dxF.filter(dx, this.alpha(this.dCutoff, dt));
-    // 自适应截止频率：速度越快截止越高（beta 加权）
     const cutoff = this.minCutoff + this.beta * Math.abs(edx);
     return this.xF.filter(x, this.alpha(cutoff, dt));
   }
 }
 
-/** 二维坐标封装：对 x/y 分别滤波；抬笔后 reset 防止新旧笔画间"飞线" */
 const smoother = {
   fx: new OneEuroFilter(CONFIG.EURO.minCutoff, CONFIG.EURO.beta, CONFIG.EURO.dCutoff),
   fy: new OneEuroFilter(CONFIG.EURO.minCutoff, CONFIG.EURO.beta, CONFIG.EURO.dCutoff),
@@ -564,150 +993,215 @@ const smoother = {
 };
 
 /* ============================================================
- * 模块 8：绘图引擎
- * 画布为透明层叠加在镜像视频上方，逻辑分辨率 640×480。
- * 笔迹绘制：二次贝塞尔中点插值——以上一段中点为起点、
- *   关键点为控制点、下一段中点为终点，天然圆滑无折角。
- * 橡皮擦：globalCompositeOperation = 'destination-out'，
- *   粗线扫过即从已画内容中"减去"。
- * 落笔反馈：起点画圆点 + 涟漪动画。
- * ============================================================ */
-const draw = {
-  pts: [],        // 当前笔画最近的关键点（贝塞尔需要保留最近 3 个）
-  active: false,
-
-  /** 橡皮擦粗细 = 画笔粗细 × 4（夹在 20~90 之间，保证擦得动） */
-  eraserWidth() { return Math.min(90, Math.max(20, state.penSize * 4)); },
-
-  beginStroke(p, erasing) {
-    history.pushSnapshot();                    // 新笔画开始前快照 → 供撤销
-    this.active = true; this.erasing = erasing;
-    this.pts = [p];
-    this.dot(p, erasing);                      // 落笔圆点
-    spawnRipple(p, erasing);                   // 落笔涟漪动画（UI 反馈）
-  },
-
-  extendStroke(p) {
-    if (!this.active) return;
-    this.pts.push(p);
-    const n = this.pts.length;
-    if (n >= 3) {
-      const [a, b, c] = [this.pts[n - 3], this.pts[n - 2], this.pts[n - 1]];
-      // 中点插值：起点=ab中点，控制点=b，终点=bc中点
-      this.seg({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, b, { x: (b.x + c.x) / 2, y: (b.y + c.y) / 2 });
-      this.pts = this.pts.slice(-2);           // 只保留最近 2 点，控制内存
-    } else if (n === 2) {
-      this.seg(this.pts[0], this.pts[0], { x: (this.pts[0].x + p.x) / 2, y: (this.pts[0].y + p.y) / 2 });
-    }
-  },
-
-  endStroke() {
-    if (!this.active) { this.pts = []; return; }
-    // 收尾：把最后半段补画到末端点
-    const n = this.pts.length;
-    if (n >= 2) this.seg(this.pts[n - 2], this.pts[n - 1], this.pts[n - 1]);
-    this.active = false; this.pts = [];
-  },
-
-  /** 画一段贝塞尔曲线（或擦除段） */
-  seg(p0, p1, p2) {
-    const erasing = this.erasing;
-    pctx.save();
-    if (erasing) {
-      pctx.globalCompositeOperation = 'destination-out';
-      pctx.lineWidth = this.eraserWidth();
-    } else {
-      pctx.strokeStyle = state.color;
-      pctx.lineWidth = state.penSize;
-      pctx.shadowColor = state.color; pctx.shadowBlur = 8;  // 霓虹发光效果
-    }
-    pctx.lineCap = 'round'; pctx.lineJoin = 'round';
-    pctx.beginPath();
-    pctx.moveTo(p0.x, p0.y);
-    pctx.quadraticCurveTo(p1.x, p1.y, p2.x, p2.y);
-    pctx.stroke();
-    pctx.restore();
-  },
-
-  /** 落笔圆点 */
-  dot(p, erasing) {
-    pctx.save();
-    if (erasing) {
-      pctx.globalCompositeOperation = 'destination-out';
-      pctx.beginPath(); pctx.arc(p.x, p.y, this.eraserWidth() / 2, 0, Math.PI * 2); pctx.fill();
-    } else {
-      pctx.fillStyle = state.color;
-      pctx.shadowColor = state.color; pctx.shadowBlur = 10;
-      pctx.beginPath(); pctx.arc(p.x, p.y, state.penSize / 2, 0, Math.PI * 2); pctx.fill();
-    }
-    pctx.restore();
-  }
-};
-
-/* ============================================================
- * 模块 9：撤销 / 重做（ImageData 快照双栈）
+ * 模块 9：撤销 / 重做工厂
  * 快照时机：每个笔画"开始前"压栈（含清空前）——
  *   撤销一次即回到上一笔画之前的状态，语义直观。
- * 新笔画开始时清空重做栈（标准编辑器行为）。
+ * 两块画布各持一套栈，互不干扰。
  * ============================================================ */
-const history = {
-  undoStack: [], redoStack: [],
-  snapshot() { return pctx.getImageData(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H); },
-  pushSnapshot() {
-    this.undoStack.push(this.snapshot());
-    if (this.undoStack.length > CONFIG.HISTORY_MAX) this.undoStack.shift(); // 超限丢弃最旧
-    this.redoStack.length = 0;
-    updateHistoryButtons();
-  },
-  undo() {
-    if (!this.undoStack.length) return toast('没有可撤销的操作', 'warn');
-    this.redoStack.push(this.snapshot());
-    pctx.putImageData(this.undoStack.pop(), 0, 0);
-    updateHistoryButtons();
-  },
-  redo() {
-    if (!this.redoStack.length) return toast('没有可重做的操作', 'warn');
-    this.undoStack.push(this.snapshot());
-    pctx.putImageData(this.redoStack.pop(), 0, 0);
-    updateHistoryButtons();
-  }
-};
+function createHistory(ctx, w, h, max) {
+  return {
+    ctx, w, h, max,
+    undoStack: [], redoStack: [],
+    snapshot() { return ctx.getImageData(0, 0, w, h); },
+    pushSnapshot() {
+      this.undoStack.push(this.snapshot());
+      if (this.undoStack.length > this.max) this.undoStack.shift();
+      this.redoStack.length = 0;
+      syncHistoryButtons();
+    },
+    undo() {
+      if (!this.undoStack.length) return toast('没有可撤销的操作', 'warn');
+      this.redoStack.push(this.snapshot());
+      ctx.putImageData(this.undoStack.pop(), 0, 0);
+      syncHistoryButtons();
+    },
+    redo() {
+      if (!this.redoStack.length) return toast('没有可重做的操作', 'warn');
+      this.undoStack.push(this.snapshot());
+      ctx.putImageData(this.redoStack.pop(), 0, 0);
+      syncHistoryButtons();
+    },
+    reset() { this.undoStack.length = 0; this.redoStack.length = 0; syncHistoryButtons(); }
+  };
+}
 
 /* ============================================================
- * 模块 10：工具栏与交互 UI
+ * 模块 8：绘图引擎工厂
+ * 笔迹绘制：二次贝塞尔中点插值——以上一段中点为起点、
+ *   关键点为控制点、下一段中点为终点，天然圆滑无折角。
+ * 橡皮擦：globalCompositeOperation = 'destination-out'。
+ * 挑战画布传 glow:false —— 关掉霓虹光晕，否则评分时墨量虚高。
+ * ============================================================ */
+function createDrawEngine(ctx, opts) {
+  opts = opts || {};
+  const W = opts.w || CONFIG.CANVAS_W, H = opts.h || CONFIG.CANVAS_H;
+  return {
+    ctx, w: W, h: H,
+    glow: opts.glow !== false,
+    pts: [], active: false, erasing: false,
+    history: createHistory(ctx, W, H, opts.historyMax || CONFIG.HISTORY_MAX),
+
+    eraserWidth() { return Math.min(90, Math.max(20, state.penSize * 4)); },
+
+    beginStroke(p, erasing) {
+      this.history.pushSnapshot();
+      this.active = true; this.erasing = erasing; this.pts = [p];
+      this.dot(p, erasing);
+      spawnRipple(p, erasing);
+    },
+
+    extendStroke(p) {
+      if (!this.active) return;
+      this.pts.push(p);
+      const n = this.pts.length;
+      if (n >= 3) {
+        const a = this.pts[n - 3], b = this.pts[n - 2], c = this.pts[n - 1];
+        this.seg({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, b, { x: (b.x + c.x) / 2, y: (b.y + c.y) / 2 });
+        this.pts = this.pts.slice(-2);
+      } else if (n === 2) {
+        this.seg(this.pts[0], this.pts[0], { x: (this.pts[0].x + p.x) / 2, y: (this.pts[0].y + p.y) / 2 });
+      }
+    },
+
+    endStroke() {
+      if (!this.active) { this.pts = []; return; }
+      const n = this.pts.length;
+      if (n >= 2) this.seg(this.pts[n - 2], this.pts[n - 1], this.pts[n - 1]);
+      this.active = false; this.pts = [];
+    },
+
+    seg(p0, p1, p2) {
+      ctx.save();
+      if (this.erasing) {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.lineWidth = this.eraserWidth();
+      } else {
+        ctx.strokeStyle = state.color;
+        ctx.lineWidth = state.penSize;
+        if (this.glow) { ctx.shadowColor = state.color; ctx.shadowBlur = 8; }
+      }
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.quadraticCurveTo(p1.x, p1.y, p2.x, p2.y);
+      ctx.stroke();
+      ctx.restore();
+    },
+
+    dot(p, erasing) {
+      ctx.save();
+      if (erasing) {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.beginPath(); ctx.arc(p.x, p.y, this.eraserWidth() / 2, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = state.color;
+        if (this.glow) { ctx.shadowColor = state.color; ctx.shadowBlur = 10; }
+        ctx.beginPath(); ctx.arc(p.x, p.y, state.penSize / 2, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+    },
+
+    clear() {
+      this.history.pushSnapshot();
+      ctx.clearRect(0, 0, W, H);
+    },
+
+    /** 抽样判断画布上有没有墨迹（步长 37 像素，约 8300 个采样点） */
+    hasInk() {
+      const d = ctx.getImageData(0, 0, W, H).data;
+      for (let i = 3; i < d.length; i += 4 * 37) if (d[i] > 8) return true;
+      return false;
+    }
+  };
+}
+
+const freeEngine = createDrawEngine(pctx, { glow: true, historyMax: CONFIG.HISTORY_MAX });
+const chEngine = createDrawEngine(chCtx, { glow: false, historyMax: CONFIG.CH_HISTORY_MAX });
+
+/* 当前活动引擎指针：切视图时重指向，老代码里的 draw.xxx 自动落到对应画布 */
+let draw = freeEngine;
+function activateEngine(eng) { if (eng) draw = eng; }
+function endActiveStroke() { if (draw.active) draw.endStroke(); }
+
+/** 离屏画布池：同一尺寸复用，避免频繁新建 */
+const scratchPool = new Map();
+function scratch(w, h) {
+  const key = w + 'x' + h;
+  let s = scratchPool.get(key);
+  if (!s) {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    s = { cv, ctx: cv.getContext('2d', { willReadFrequently: true }) };
+    scratchPool.set(key, s);
+  }
+  return s;
+}
+
+/* ============================================================
+ * 模块 10：通用 UI
  * ============================================================ */
 function toast(msg, type) {
   const el = document.createElement('div');
   el.className = 'toast' + (type ? ' ' + type : '');
   el.textContent = msg;
   $('toasts').appendChild(el);
-  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, 2100);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, 2200);
 }
 
 function updateBadge() {
   const map = {
-    BOOT: ['未启动', ''], IDLE: ['未检测到手', 's-idle'], DRAW: ['绘制中', 's-draw'],
+    BOOT: ['未启动', 's-idle'], IDLE: ['未检测到手', 's-idle'], DRAW: ['绘制中', 's-draw'],
     PAUSE: ['暂停 · 抬笔', 's-pause'], ERASE: ['橡皮擦中', 's-erase'], STOP: ['已停止', 's-stop']
   };
-  const [text, cls] = map[state.phase];
-  badgeEl.textContent = text;
-  badgeEl.className = cls;
+  const m = map[state.phase] || map.IDLE;
+  badgeEl.textContent = m[0];
+  badgeEl.className = m[1];
 }
 
-function updateHistoryButtons() {
-  $('btnUndo').disabled = !history.undoStack.length;
-  $('btnRedo').disabled = !history.redoStack.length;
+const ICON = {
+  pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4L7 21H3v-4L17 3z"/></svg>',
+  eraser: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><path d="M5 13l8-8 5 5-7 7H7l-2-2v-2z"/></svg>',
+  undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10h10a5 5 0 015 5v1"/><path d="M3 10l4-4"/><path d="M3 10l4 4"/></svg>',
+  redo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10H11a5 5 0 00-5 5v1"/><path d="M21 10l-4-4"/><path d="M21 10l-4 4"/></svg>',
+  clear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5v14"/><path d="M14 5v14"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/></svg>'
+};
+
+/** 两段式确认：第一次点击进入"待确认"，3 秒内再点一次才执行 */
+function twoStep(el, tip, fn, altText) {
+  const restore = () => {
+    delete el.dataset.armed;
+    el.classList.remove('confirm');
+    if (el.dataset.origText) { el.textContent = el.dataset.origText; delete el.dataset.origText; }
+  };
+  if (el.dataset.armed === '1') { restore(); fn(); return; }
+  el.dataset.armed = '1';
+  el.classList.add('confirm');
+  if (altText) { el.dataset.origText = el.textContent; el.textContent = altText; }
+  toast(tip, 'warn');
+  setTimeout(() => { if (el.dataset.armed === '1') restore(); }, 3000);
+}
+
+function applyColor(c) {
+  state.color = c;
+  if (state.tool === 'eraser') setTool('pen');
+  syncToolbars(); updateCursorStyle();
+}
+
+function applySize(v) {
+  state.penSize = Math.max(2, Math.min(30, Math.round(v)));
+  syncToolbars();
 }
 
 /** 切换画笔/橡皮工具；byGesture=true 表示来自握拳手势 */
 function setTool(tool, byGesture) {
   state.tool = tool;
-  $('btnPen').classList.toggle('active', tool === 'pen');
-  $('btnEraser').classList.toggle('active', tool === 'eraser');
-  // 工具切换时结束当前笔画，避免一支笔画到一半换风格
   draw.endStroke();
   if (byGesture) toast(tool === 'eraser' ? '已切换到橡皮擦（握拳 1 秒切回画笔）' : '已切换到画笔');
-  updateCursorStyle();
+  syncToolbars(); updateCursorStyle();
 }
 
 /** 落笔涟漪动画（DOM 元素，600ms 后自动移除） */
@@ -716,170 +1210,1172 @@ function spawnRipple(p, erasing) {
   r.className = 'ripple' + (erasing ? ' erase' : '');
   r.style.left = (p.x / CONFIG.CANVAS_W * 100) + '%';
   r.style.top = (p.y / CONFIG.CANVAS_H * 100) + '%';
-  $('stage').appendChild(r);
+  stageEl.appendChild(r);
   setTimeout(() => r.remove(), 600);
 }
 
-/** 按状态更新指尖光标样式 */
 function updateCursorStyle() {
   cursorEl.className = '';
   switch (state.phase) {
-    case 'DRAW':
-      cursorEl.classList.add('pen');
-      cursorEl.style.setProperty('--curColor', state.color);
-      break;
+    case 'DRAW': cursorEl.classList.add('pen'); cursorEl.style.setProperty('--curColor', state.color); break;
     case 'ERASE': cursorEl.classList.add('erase'); break;
     case 'PAUSE': cursorEl.classList.add('pause'); break;
     case 'STOP': cursorEl.classList.add('stop'); break;
   }
 }
 
-/** 更新光标位置（画布逻辑坐标 → 舞台百分比，天然适配缩放） */
 function moveCursor(p) {
+  if (!stageEl.classList.contains('show')) return;
   cursorEl.style.display = 'block';
   cursorEl.style.left = (p.x / CONFIG.CANVAS_W * 100) + '%';
   cursorEl.style.top = (p.y / CONFIG.CANVAS_H * 100) + '%';
 }
 
-function initToolbar() {
-  // 色板
-  PALETTE.forEach((c, i) => {
-    const s = document.createElement('button');
-    s.className = 'swatch' + (i === 0 ? ' active' : '');
-    s.style.background = c;
-    s.title = c;
-    s.onclick = () => {
-      state.color = c;
-      document.querySelectorAll('.swatch').forEach(x => x.classList.remove('active'));
-      s.classList.add('active');
-      if (state.tool === 'eraser') setTool('pen'); // 选颜色自动回到画笔
-      updateCursorStyle();
-    };
-    $('palette').appendChild(s);
+/* ---------- 工具栏：一套模板生成两根工具栏，事件委托 ---------- */
+function toolbarHTML(extra) {
+  return `
+  <div class="tgroup">
+    <button class="tbtn" data-act="pen" title="画笔模式（伸食指绘制）">${ICON.pen}</button>
+    <button class="tbtn" data-act="eraser" title="橡皮擦（或握拳保持1秒切换）">${ICON.eraser}</button>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup" data-palette></div>
+  <div class="sep"></div>
+  <div class="tgroup size-group">
+    <input type="range" class="size-range" min="2" max="30" step="1" value="${state.penSize}" title="画笔粗细">
+    <span class="size-label">${state.penSize} px</span>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup">
+    <button class="tbtn" data-act="undo" title="撤销 (Ctrl+Z)">${ICON.undo}</button>
+    <button class="tbtn" data-act="redo" title="重做 (Ctrl+Y)">${ICON.redo}</button>
+    <button class="tbtn" data-act="clear" title="清空画布（点两次确认）">${ICON.clear}</button>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup">
+    <button class="tbtn" data-act="pause" title="暂停 / 恢复追踪">${ICON.pause}</button>
+    ${extra === 'challenge'
+      ? `<button class="tbtn wide primary" data-act="submit">${ICON.check}提交评分</button>
+         <button class="tbtn wide" data-act="next" title="换一幅">${ICON.refresh}换一幅</button>`
+      : `<button class="tbtn" data-act="export" title="导出 PNG 图片">${ICON.download}</button>
+         <button class="tbtn wide" data-act="saveGal" title="保存到我的画廊">存入画廊</button>`}
+  </div>`;
+}
+
+const toolbars = [];
+let uiReady = false;
+
+function createToolbar(host, opts) {
+  opts = opts || {};
+  host.innerHTML = toolbarHTML(opts.extra);
+  host.querySelectorAll('[data-palette]').forEach(box => {
+    PALETTE.forEach(c => {
+      const b = document.createElement('button');
+      b.className = 'swatch';
+      b.dataset.color = c;
+      b.style.background = c;
+      b.title = c;
+      box.appendChild(b);
+    });
   });
 
-  // 粗细滑块
-  $('sizeSlider').oninput = e => {
-    state.penSize = +e.target.value;
-    $('sizeLabel').textContent = state.penSize + ' px';
-  };
-
-  // 工具按钮
-  $('btnPen').onclick = () => setTool('pen');
-  $('btnEraser').onclick = () => setTool('eraser');
-
-  // 撤销 / 重做（含键盘快捷键）
-  $('btnUndo').onclick = () => history.undo();
-  $('btnRedo').onclick = () => history.redo();
-  document.addEventListener('keydown', e => {
-    if (!(e.ctrlKey || e.metaKey)) return;
-    if (e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); history.undo(); }
-    if (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z')) { e.preventDefault(); history.redo(); }
-  });
-
-  // 清空：两段式确认（第一次点击变红提示，3 秒内再点一次才执行）
-  let clearArmed = 0, clearTimer = null;
-  $('btnClear').onclick = () => {
-    const btn = $('btnClear');
-    if (clearArmed && Date.now() - clearArmed < 3000) {
-      history.pushSnapshot();                                   // 清空前同样可撤销
-      pctx.clearRect(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
-      clearArmed = 0; btn.classList.remove('confirm');
-      clearTimeout(clearTimer);
-      toast('画布已清空（可撤销）');
-    } else {
-      clearArmed = Date.now();
-      btn.classList.add('confirm');
-      toast('再点一次「清空」确认', 'warn');
-      clearTimeout(clearTimer);
-      clearTimer = setTimeout(() => { btn.classList.remove('confirm'); clearArmed = 0; }, 3000);
+  const t = {
+    host,
+    sync() {
+      host.querySelectorAll('[data-act="pen"]').forEach(b => b.classList.toggle('active', state.tool === 'pen'));
+      host.querySelectorAll('[data-act="eraser"]').forEach(b => b.classList.toggle('active', state.tool === 'eraser'));
+      host.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', s.dataset.color === state.color));
+      const u = host.querySelector('[data-act="undo"]'), r = host.querySelector('[data-act="redo"]');
+      if (u) u.disabled = !draw.history.undoStack.length;
+      if (r) r.disabled = !draw.history.redoStack.length;
+      const p = host.querySelector('[data-act="pause"]');
+      if (p) p.classList.toggle('active', !loop.running);
+      const rg = host.querySelector('.size-range');
+      if (rg) { rg.value = state.penSize; host.querySelector('.size-label').textContent = state.penSize + ' px'; }
     }
   };
 
-  // 暂停 / 恢复追踪
-  $('btnPause').onclick = () => {
-    state.running = !state.running;
-    const icon = $('btnPause');
-    if (state.running) { setState('IDLE'); startLoop(); toast('已恢复追踪'); icon.classList.remove('active'); }
-    else { draw.endStroke(); setState('PAUSE'); toast('已暂停追踪（点击恢复）', 'warn'); icon.classList.add('active'); }
-  };
+  host.addEventListener('click', e => {
+    const el = e.target.closest('[data-act],[data-color]');
+    if (!el) return;
+    if (el.dataset.color) { applyColor(el.dataset.color); return; }
+    const act = el.dataset.act;
+    if (act === 'pen') setTool('pen');
+    else if (act === 'eraser') setTool('eraser');
+    else if (act === 'undo') draw.history.undo();
+    else if (act === 'redo') draw.history.redo();
+    else if (act === 'clear') twoStep(el, '再点一次「清空」确认', () => { draw.clear(); toast('画布已清空（可撤销）'); });
+    else if (act === 'pause') {
+      if (loop.running) { loop.stop(); toast('已暂停追踪（点击恢复）', 'warn'); }
+      else { loop.start(); toast('已恢复追踪'); }
+    }
+    else if (act === 'export') exportCanvas(draw.ctx.canvas, 'aircanvas');
+    else if (act === 'saveGal') saveFreeArtwork();
+    else if (act === 'submit') submitChallenge();
+    else if (act === 'next') nextChallenge(false);
+    syncToolbars();
+  });
 
-  // 保存 PNG
-  $('btnSave').onclick = savePNG;
-  updateHistoryButtons();
+  host.addEventListener('input', e => {
+    if (e.target.classList.contains('size-range')) applySize(+e.target.value);
+  });
+
+  toolbars.push(t);
+  return t;
 }
 
+function syncToolbars() { if (uiReady) toolbars.forEach(t => t.sync()); }
+function syncHistoryButtons() { syncToolbars(); }
+
 /* ============================================================
- * 模块 11：PNG 导出
- * 新建临时画布：深色底 + 作品内容（摄像头画面不导出，只留笔迹）
+ * 模块 11：视图路由 + 舞台吸附 + 主循环控制器
  * ============================================================ */
-function savePNG() {
+const VIEW_META = {
+  home:      { title: '手势隔空绘画', slot: false, run: false },
+  free:      { title: '自由画板',     slot: true,  run: true  },
+  challenge: { title: '模仿挑战',     slot: true,  run: true  },
+  gallery:   { title: '我的画廊',     slot: false, run: false }
+};
+let curView = '';
+
+/** 把唯一的 #stage 吸附到当前视图的 .stage-slot 上（不搬 DOM，避免视频黑帧） */
+function syncStageToSlot() {
+  const view = document.getElementById('view-' + curView);
+  const meta = VIEW_META[curView];
+  if (!view || !meta || !meta.slot) { stageEl.classList.remove('show'); return; }
+  const slot = view.querySelector('.stage-slot');
+  if (!slot) { stageEl.classList.remove('show'); return; }
+  const r = slot.getBoundingClientRect(), b = viewsEl.getBoundingClientRect();
+  if (r.width < 40 || r.height < 40) { stageEl.classList.remove('show'); return; }
+  stageEl.style.left = (r.left - b.left) + 'px';
+  stageEl.style.top = (r.top - b.top) + 'px';
+  stageEl.style.width = r.width + 'px';
+  stageEl.style.height = r.height + 'px';
+  stageEl.dataset.view = curView;
+  stageEl.classList.add('show');
+}
+
+function showView(name, opts) {
+  opts = opts || {};
+  if (!VIEW_META[name]) name = 'home';
+  if (name === curView && !opts.force) { syncStageToSlot(); return; }
+
+  /* ① 离开清理：必须抬笔 + 清滤波器 + 重置手势稳定器，否则新视图第一帧会"飞线" */
+  endActiveStroke();
+  smoother.reset();
+  stabilizer.reset();
+  state.fistHoldStart = 0; state.fistHoldFired = false;
+  stageEl.querySelectorAll('.ripple').forEach(n => n.remove());
+
+  /* ② 切视图 */
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.dataset.view === name));
+  curView = name;
+
+  /* ③ 引擎指针 */
+  if (name === 'free') activateEngine(freeEngine);
+  else if (name === 'challenge') activateEngine(chEngine);
+
+  /* ④ 舞台 + 循环 */
+  syncStageToSlot();
+  if (VIEW_META[name].run) loop.start(); else loop.stop();
+
+  /* ⑤ 视图专属渲染 */
+  if (name === 'gallery') renderGallery();
+  if (name === 'challenge') ensureChallenge();
+  if (name === 'home') renderHomePreview();
+
+  /* ⑥ 顶栏 */
+  $('btnBack').classList.toggle('show', name !== 'home');
+  $('viewTitle').textContent = VIEW_META[name].title;
+  badgeEl.style.opacity = VIEW_META[name].run ? 1 : .4;
+
+  syncToolbars();
+  setTimeout(syncStageToSlot, 0);
+}
+
+/** 主循环控制器：代次守卫防止暂停/恢复产生并行 rAF 链 */
+const loop = {
+  running: false,
+  gen: 0,
+  start() {
+    if (this.running || !hands) return;
+    this.running = true;
+    const myGen = ++this.gen;
+    const tick = async () => {
+      if (!this.running || myGen !== this.gen) return;
+      if (!sendBusy && video.readyState >= 2) {
+        sendBusy = true;
+        try { await hands.send({ image: video }); }
+        catch (e) { /* 单帧失败忽略 */ }
+        finally { sendBusy = false; }
+      }
+      if (this.running && myGen === this.gen) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    syncToolbars();
+  },
+  stop() {
+    this.running = false;
+    this.gen++;
+    endActiveStroke();
+    smoother.reset();
+    stabilizer.reset();
+    state.fistHoldStart = 0; state.fistHoldFired = false;
+    cursorEl.style.display = 'none';
+    noHandTip.classList.remove('show');
+    fpsEl.textContent = '-- FPS';
+    if (state.phase !== 'BOOT') setState('IDLE');
+    syncToolbars();
+  }
+};
+
+/* ============================================================
+ * 模块 12：导出与作品快照
+ * ============================================================ */
+function timestampName(prefix) {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return prefix + '_' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+function exportCanvas(cv, prefix) {
   const t = document.createElement('canvas');
   t.width = CONFIG.CANVAS_W; t.height = CONFIG.CANVAS_H;
   const c = t.getContext('2d');
-  c.fillStyle = '#0b1120'; c.fillRect(0, 0, t.width, t.height);   // 深色底衬托霓虹笔迹
-  c.drawImage(paintCv, 0, 0);
+  c.fillStyle = '#0b1120'; c.fillRect(0, 0, t.width, t.height);
+  c.drawImage(cv, 0, 0);
   const a = document.createElement('a');
-  const ts = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(/(\d{8})(\d{6})/, '$1_$2');
-  a.download = 'aircanvas_' + ts + '.png';
+  a.download = timestampName(prefix) + '.png';
   a.href = t.toDataURL('image/png');
   a.click();
   toast('已保存为 PNG 图片');
 }
 
+/** 生成作品大图 + 缩略图（JPEG 无透明通道，必须先铺深色底） */
+function captureArtwork(engine) {
+  const G = CONFIG.GALLERY;
+  const cv = document.createElement('canvas');
+  cv.width = CONFIG.CANVAS_W; cv.height = CONFIG.CANVAS_H;
+  const c = cv.getContext('2d');
+  const grd = c.createLinearGradient(0, 0, cv.width, cv.height);
+  grd.addColorStop(0, '#0d1526'); grd.addColorStop(1, '#080c18');
+  c.fillStyle = grd; c.fillRect(0, 0, cv.width, cv.height);
+  c.drawImage(engine.ctx.canvas, 0, 0);
+
+  const full = cv.toDataURL('image/jpeg', G.FULL_Q);
+
+  const th = document.createElement('canvas');
+  th.width = G.THUMB_W; th.height = G.THUMB_H;
+  const tc = th.getContext('2d');
+  tc.fillStyle = '#0b1120'; tc.fillRect(0, 0, G.THUMB_W, G.THUMB_H);
+  tc.drawImage(cv, 0, 0, G.THUMB_W, G.THUMB_H);
+  const thumb = th.toDataURL('image/jpeg', G.THUMB_Q);
+
+  return { full, thumb, w: cv.width, h: cv.height, bytes: full.length + thumb.length };
+}
+
+function buildItem(engine, opts) {
+  const shot = captureArtwork(engine);
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return {
+    id: 'g_' + d.getTime() + '_' + Math.random().toString(36).slice(2, 6),
+    title: opts.title || '自由创作',
+    module: opts.module || 'free',
+    targetId: opts.targetId || null,
+    score: (opts.score == null ? null : opts.score),
+    ts: d.getTime(),
+    w: shot.w, h: shot.h,
+    thumb: shot.thumb, full: shot.full, bytes: shot.bytes,
+    dateText: d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+  };
+}
+
 /* ============================================================
- * 模块 12：主流程编排
- * 启动流程：点击启动 → 开摄像头 → 加载 MediaPipe（CDN 容错）
- *           → 首帧识别成功后进入主界面
- * 主循环：rAF + hands.send 逐帧识别
- *   onResults：关键点 → 手势稳定 → 状态机 → 滤波 → 绘制/抬笔
+ * 模块 13：模仿挑战
+ * 线稿统一 viewBox 400×300，只用 M/L/C/Q/Z + circles，
+ * 用 Path2D 绘制 —— 同一份数据同时服务预览、描摹层和评分掩膜。
  * ============================================================ */
-let hands = null;          // MediaPipe Hands 实例
-let sendBusy = false;      // 防止上一帧未处理完就送下一帧
-let firstResult = true;    // 首帧标志（用于关闭加载动画）
+const CHALLENGES = [
+  { id: 'star', name: '星星', level: 'easy', paths: [
+    'M200 45 L228 132 L320 132 L246 186 L274 273 L200 220 L126 273 L154 186 L80 132 L172 132 Z'
+  ], circles: [] },
+
+  { id: 'house', name: '房子', level: 'easy', paths: [
+    'M80 150 L200 62 L320 150',
+    'M100 142 L100 262 L300 262 L300 142',
+    'M170 262 L170 200 L230 200 L230 262',
+    'M122 166 h40 v40 h-40 z',
+    'M262 122 L262 78 L286 78 L286 142'
+  ], circles: [[140, 128, 6]] },
+
+  { id: 'fish', name: '小鱼', level: 'easy', paths: [
+    'M300 150 C300 100 232 76 168 76 C104 76 58 108 58 150 C58 192 104 224 168 224 C232 224 300 200 300 150 Z',
+    'M300 150 L352 108 L352 192 Z',
+    'M130 150 C150 172 180 178 205 162'
+  ], circles: [[140, 128, 7]] },
+
+  { id: 'icecream', name: '冰淇淋', level: 'easy', paths: [
+    'M150 168 L200 288 L250 168 Z',
+    'M164 202 L232 202',
+    'M176 238 L220 238',
+    'M200 64 q8 -14 18 -16'
+  ], circles: [[172, 138, 32], [228, 138, 32], [200, 102, 34], [200, 66, 9]] },
+
+  { id: 'tree', name: '大树', level: 'easy', paths: [
+    'M186 266 L186 182',
+    'M214 266 L214 182',
+    'M110 270 q90 18 180 0'
+  ], circles: [[200, 128, 56], [158, 164, 40], [242, 164, 40]] },
+
+  { id: 'cat', name: '小猫', level: 'medium', paths: [
+    'M156 76 L140 28 L186 56',
+    'M244 76 L260 28 L214 56',
+    'M200 132 l-9 9 h18 z',
+    'M160 142 L108 132', 'M160 152 L108 156',
+    'M240 142 L292 132', 'M240 152 L292 156',
+    'M156 176 C140 232 152 272 200 272 C248 272 260 232 244 176',
+    'M244 252 C292 246 302 208 284 188'
+  ], circles: [[200, 122, 58], [178, 112, 7], [222, 112, 7]] },
+
+  { id: 'chick', name: '小鸡', level: 'medium', paths: [
+    'M216 100 L250 110 L216 120 Z',
+    'M180 56 q10 -18 20 0 q10 -18 20 0',
+    'M174 168 q34 -16 60 12',
+    'M176 248 L176 278', 'M164 278 L188 278',
+    'M224 248 L224 278', 'M212 278 L236 278'
+  ], circles: [[200, 182, 70], [200, 96, 42], [186, 86, 6]] },
+
+  { id: 'umbrella', name: '雨伞', level: 'medium', paths: [
+    'M70 158 Q200 30 330 158',
+    'M70 158 q33 26 66 0 q33 26 66 0 q33 26 66 0 q33 26 66 0',
+    'M200 40 L200 158',
+    'M200 158 L200 250 q0 22 -22 22 q-22 0 -22 -20',
+    'M200 40 L200 24'
+  ], circles: [] }
+];
+
+let curTargetId = CHALLENGES[0].id;
+let lastScore = null;
+let pendingTarget = null, pendingTimer = null;
+
+function curTarget() {
+  return CHALLENGES.find(c => c.id === curTargetId) || CHALLENGES[0];
+}
+
+/** 把一份线稿画进 w×h 的区域（viewBox 400×300 等比居中） */
+function drawReference(ctx, target, w, h, lineWidth, color) {
+  const s = Math.min(w / 400, h / 300);
+  const ox = (w - 400 * s) / 2, oy = (h - 300 * s) / 2;
+  ctx.save();
+  ctx.translate(ox, oy);
+  ctx.scale(s, s);
+  ctx.strokeStyle = color || '#c7d2fe';
+  ctx.lineWidth = (lineWidth || 8) / s;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  target.paths.forEach(d => ctx.stroke(new Path2D(d)));
+  (target.circles || []).forEach(c => {
+    ctx.beginPath(); ctx.arc(c[0], c[1], c[2], 0, Math.PI * 2); ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function renderRefCanvas() {
+  const cv = $('refCv'), w = cv.width, h = cv.height;
+  const c = cv.getContext('2d');
+  c.clearRect(0, 0, w, h);
+  // 淡网格，给出"画布"的参照
+  c.strokeStyle = 'rgba(148,163,184,.10)';
+  c.lineWidth = 1;
+  for (let x = 0; x <= w; x += 40) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke(); }
+  for (let y = 0; y <= h; y += 40) { c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke(); }
+  c.save();
+  c.shadowColor = 'rgba(99,102,241,.55)';
+  c.shadowBlur = 14;
+  drawReference(c, curTarget(), w, h, 9, '#c7d2fe');
+  c.restore();
+}
+
+function renderTraceCanvas() {
+  tctx.clearRect(0, 0, traceCv.width, traceCv.height);
+  drawReference(tctx, curTarget(), traceCv.width, traceCv.height, 4, '#ffffff');
+}
+
+function renderChips() {
+  const box = $('chChips');
+  box.innerHTML = '';
+  CHALLENGES.forEach(t => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (t.id === curTargetId ? ' active' : '');
+    b.textContent = t.name;
+    b.onclick = () => selectTarget(t.id);
+    box.appendChild(b);
+  });
+}
+
+function ensureChallenge() {
+  $('chLevel').textContent = curTarget().level === 'easy' ? '简单' : '中等';
+  renderRefCanvas();
+  renderTraceCanvas();
+  renderChips();
+}
+
+/** 换题目：画布上有内容时需要连点两次，避免手一滑把作品清了 */
+function selectTarget(id, force) {
+  if (id === curTargetId) { pendingTarget = null; return; }
+  if (!force && chEngine.hasInk()) {
+    if (pendingTarget !== id) {
+      pendingTarget = id;
+      clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(() => { pendingTarget = null; }, 3000);
+      toast('画布上有内容，再点一次「' + (CHALLENGES.find(c => c.id === id) || {}).name + '」将清空重画', 'warn');
+      return;
+    }
+  }
+  pendingTarget = null;
+  curTargetId = id;
+  chCtx.clearRect(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
+  chEngine.history.reset();
+  ensureChallenge();
+  syncToolbars();
+}
+
+function nextChallenge(force) {
+  const i = CHALLENGES.findIndex(c => c.id === curTargetId);
+  const n = CHALLENGES[(i + 1) % CHALLENGES.length];
+  selectTarget(n.id, !!force);
+}
+
+/* ---------- 评分核心：掩膜 → 距离变换 → 得分 ---------- */
+/* ===== SCORE-CORE:BEGIN ===== */
+
+/** RGBA 数据 → 二值掩膜；n 为墨迹像素数 */
+function maskFromAlpha(data, W, H, th) {
+  const m = new Uint8Array(W * H);
+  let n = 0;
+  for (let i = 0, p = 3; i < m.length; i++, p += 4) if (data[p] >= th) { m[i] = 1; n++; }
+  return { m, n, W, H };
+}
+
+/**
+ * Chamfer 3-4 距离变换（两遍扫描，O(W·H)）
+ * 返回值是"加权距离"：水平/垂直步长 3、对角步长 4，
+ * 所以真实像素距离 ≈ 返回值 / 3。
+ */
+function chamfer34(mask, W, H) {
+  const INF = 1e7;
+  const dt = new Float32Array(W * H);
+  for (let i = 0; i < dt.length; i++) dt[i] = mask[i] ? 0 : INF;
+
+  // 前向：左、上、左上、右上
+  for (let y = 0; y < H; y++) {
+    const row = y * W, up = row - W;
+    for (let x = 0; x < W; x++) {
+      const i = row + x;
+      let d = dt[i];
+      if (d === 0) continue;
+      if (x > 0 && dt[i - 1] + 3 < d) d = dt[i - 1] + 3;
+      if (y > 0) {
+        if (dt[up + x] + 3 < d) d = dt[up + x] + 3;
+        if (x > 0 && dt[up + x - 1] + 4 < d) d = dt[up + x - 1] + 4;
+        if (x < W - 1 && dt[up + x + 1] + 4 < d) d = dt[up + x + 1] + 4;
+      }
+      dt[i] = d;
+    }
+  }
+  // 后向：右、下、右下、左下
+  for (let y = H - 1; y >= 0; y--) {
+    const row = y * W, dn = row + W;
+    for (let x = W - 1; x >= 0; x--) {
+      const i = row + x;
+      let d = dt[i];
+      if (d === 0) continue;
+      if (x < W - 1 && dt[i + 1] + 3 < d) d = dt[i + 1] + 3;
+      if (y < H - 1) {
+        if (dt[dn + x] + 3 < d) d = dt[dn + x] + 3;
+        if (x < W - 1 && dt[dn + x + 1] + 4 < d) d = dt[dn + x + 1] + 4;
+        if (x > 0 && dt[dn + x - 1] + 4 < d) d = dt[dn + x - 1] + 4;
+      }
+      dt[i] = d;
+    }
+  }
+  return dt;
+}
+
+/**
+ * 打分 = 精确度 × 完整度
+ *   精确度 meanA：用户每一笔墨迹到最近参考线的平均距离（画歪了就低）
+ *   完整度 cov：用户墨量 / 参考墨量，漏画太多按比例扣
+ * 为什么不用"双向平均"：只画一半时双向平均会被"画对的那一半"拉高，
+ * 乱涂时又会被"确实盖住了参考线"拉高，两种情况区分不开。
+ */
+function scoreFromMasks(ref, usr, dtRef, dtUsr, P) {
+  const N = ref.W * ref.H;
+  if (usr.n < N * 0.002) return { score: 0, dPx: 999, cov: 0, reason: 'empty' };
+
+  let sa = 0;
+  for (let i = 0; i < N; i++) if (usr.m[i]) sa += dtRef[i];
+  const meanA = sa / Math.max(usr.n, 1) / 3;      // 加权距离换回像素
+
+  let sb = 0;
+  for (let i = 0; i < N; i++) if (ref.m[i]) sb += dtUsr[i];
+  const meanB = sb / Math.max(ref.n, 1) / 3;
+
+  const cov = usr.n / Math.max(ref.n, 1);
+
+  let base = 100 * (1 - meanA / P.tauPx);
+  base = Math.max(0, Math.min(100, base));
+
+  let covFactor = 1;
+  if (cov < P.fullCoverage) covFactor = Math.max(0, cov / P.fullCoverage);
+  if (cov > P.maxCoverage) covFactor *= 0.85;      // 满屏乱涂刷覆盖率
+
+  const score = Math.round(Math.max(0, Math.min(100, base * covFactor)));
+  return {
+    score,
+    dPx: +meanA.toFixed(1),
+    cov: +cov.toFixed(2),
+    meanA: +meanA.toFixed(1),
+    meanB: +meanB.toFixed(1),
+    reason: 'ok'
+  };
+}
+/* ===== SCORE-CORE:END ===== */
+
+function gradeOf(s) {
+  if (s >= 85) return { t: '神还原！', c: '#22c55e', tip: '轮廓几乎贴合，可以挑战中等难度了' };
+  if (s >= 70) return { t: '很棒', c: '#4ade80', tip: '整体相似度很高，注意收笔的细节' };
+  if (s >= 50) return { t: '有模有样', c: '#facc15', tip: '大形对了，试着把剩下的轮廓描完' };
+  if (s >= 30) return { t: '继续加油', c: '#fb923c', tip: '覆盖率偏低，先描外轮廓再补内部' };
+  return { t: '再接再厉', c: '#ef4444', tip: '把手移到参考线附近，沿着轮廓慢慢移动' };
+}
+
+/** 参考线稿 → 掩膜：直接按 240×180 光栅化，线宽换算成掩膜像素 */
+function buildRefMask(target, W, H) {
+  const s = scratch(W, H);
+  s.ctx.clearRect(0, 0, W, H);
+  drawReference(s.ctx, target, W, H, 2.6, '#ffffff');
+  return maskFromAlpha(s.ctx.getImageData(0, 0, W, H).data, W, H, CONFIG.SCORE.refAlpha);
+}
+
+/** 用户画布 → 掩膜：整幅缩到 240×180 后按 alpha 取值（忽略颜色） */
+function buildUserMask(srcCanvas, W, H) {
+  const s = scratch(W, H);
+  s.ctx.clearRect(0, 0, W, H);
+  s.ctx.imageSmoothingEnabled = true;
+  s.ctx.drawImage(srcCanvas, 0, 0, W, H);
+  return maskFromAlpha(s.ctx.getImageData(0, 0, W, H).data, W, H, CONFIG.SCORE.inkAlpha);
+}
+
+/** 三色重合图：蓝=仅参考 / 红=仅你的 / 白=重合（用距离容差显式判定，不能靠图层相加） */
+function renderTriColor(ref, usr, dtUsr) {
+  const W = ref.W, H = ref.H, N = W * H;
+  const tmp = scratch(W, H);
+  const img = tmp.ctx.createImageData(W, H);
+  const d = img.data;
+  const TOL = CONFIG.SCORE.nearTol * 3;
+  for (let i = 0, p = 0; i < N; i++, p += 4) {
+    let r = 8, g = 12, b = 26;
+    if (ref.m[i]) {
+      if (usr.m[i] || dtUsr[i] <= TOL) { r = 255; g = 255; b = 255; }
+      else { r = 96; g = 165; b = 250; }
+    } else if (usr.m[i]) { r = 248; g = 113; b = 113; }
+    d[p] = r; d[p + 1] = g; d[p + 2] = b; d[p + 3] = 255;
+  }
+  tmp.ctx.putImageData(img, 0, 0);
+
+  const out = $('triCv');
+  const oc = out.getContext('2d');
+  oc.imageSmoothingEnabled = false;
+  oc.clearRect(0, 0, out.width, out.height);
+  oc.drawImage(tmp.cv, 0, 0, out.width, out.height);
+}
+
+function submitChallenge() {
+  const t = curTarget();
+  if (!chEngine.hasInk()) { toast('画布还是空的，先画几笔再提交评分', 'warn'); return; }
+
+  const W = CONFIG.SCORE.W, H = CONFIG.SCORE.H;
+  const ref = buildRefMask(t, W, H);
+  const usr = buildUserMask(chCv, W, H);
+  const dtRef = chamfer34(ref.m, W, H);
+  const dtUsr = chamfer34(usr.m, W, H);
+  const res = scoreFromMasks(ref, usr, dtRef, dtUsr, CONFIG.SCORE);
+
+  lastScore = res.score;
+  renderTriColor(ref, usr, dtUsr);
+
+  const g = gradeOf(res.score);
+  $('scoreNum').textContent = res.score;
+  $('scoreGrade').textContent = g.t;
+  $('scoreGrade').style.color = g.c;
+  $('scoreTip').textContent = g.tip;
+  $('scoreName').textContent = t.name;
+  $('mDev').textContent = res.reason === 'empty'
+    ? '—'
+    : (res.dPx * CONFIG.CANVAS_W / CONFIG.SCORE.W).toFixed(0) + ' px';
+  $('mCov').textContent = Math.round(res.cov * 100) + '%';
+
+  $('scoreModal').classList.add('show');
+  loop.stop();
+}
+
+function closeScoreModal(restart) {
+  $('scoreModal').classList.remove('show');
+  if (restart !== false && (curView === 'free' || curView === 'challenge')) loop.start();
+}
+
+async function saveFreeArtwork() {
+  if (!freeEngine.hasInk()) { toast('画布还是空的，先画几笔再保存', 'warn'); return; }
+  const list = await listArtworks();
+  const n = list.filter(x => x.module === 'free').length + 1;
+  const item = buildItem(freeEngine, { module: 'free', title: '自由创作 #' + n });
+  if (await addArtwork(item)) await renderHomePreview();
+}
+
+async function saveChallengeArtwork() {
+  const t = curTarget();
+  const item = buildItem(chEngine, {
+    module: 'challenge',
+    title: '模仿 · ' + t.name,
+    targetId: t.id,
+    score: lastScore
+  });
+  if (!(await addArtwork(item))) return;
+  closeScoreModal();
+  await renderHomePreview();
+}
+
+/* ============================================================
+ * 模块 14：账号与我的画廊（云端 / 本地 双模式）
+ *
+ * 上层只用这三个接口，不关心数据到底在哪：
+ *   listArtworks()   读全部作品（新→旧）
+ *   addArtwork()     存一件
+ *   deleteArtwork()  删一件
+ * 判定规则：填了 CONFIG.SUPABASE 且已登录 → 走云端；
+ *          没填、或没登录 → 退回浏览器本地存储（原逻辑，完全兼容）。
+ *
+ * 云端结构：
+ *   table  artworks(id, user_id, title, module, target_id, score,
+ *                   w, h, thumb_url, full_url, bytes, created_at)
+ *   bucket 'artworks'（public 读），路径 {user_id}/{id}_full.jpg
+ *   权限全靠 RLS：每条策略都带 auth.uid() = user_id，前端拿到的
+ *   anon key 本身不带任何权限，越权请求会被数据库直接拒绝。
+ *
+ * 本机容量估算（未登录时用）：
+ *   640×480 JPEG q0.72 稀疏线条约 35–90 KB，base64 膨胀 ×1.37 → 48–123 KB/张
+ *   40 张合计约 2–5 MB，正卡在浏览器 5 MB 配额边缘 → persistLocal 逐级淘汰兜底
+ * ============================================================ */
+const G = CONFIG.GALLERY;
+const SB = CONFIG.SUPABASE;
+
+let sb = null;             // Supabase 客户端（全局唯一）
+let sbUser = null;         // 当前登录用户 { id, username }
+let sbInitPromise = null;
+let cloudCache = null;     // 云端作品内存缓存，任何写操作后置空
+let localCache = null;     // 本地作品内存缓存
+
+const cloudEnabled = () => !!(SB.URL && SB.ANON_KEY);
+const cloudMode = () => !!(sb && sbUser);
+
+/* ---------- 14.1 客户端初始化 ---------- */
+async function initCloud() {
+  if (!cloudEnabled()) return null;
+  if (sb) return sb;
+  if (!sbInitPromise) {
+    sbInitPromise = (async () => {
+      try {
+        if (typeof window.supabase === 'undefined') {
+          await loadScriptOnce('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js');
+        }
+        sb = window.supabase.createClient(SB.URL, SB.ANON_KEY, {
+          auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
+        });
+        // 先订阅再取会话：INITIAL_SESSION 事件会带回上次登录态
+        sb.auth.onAuthStateChange((_evt, session) => {
+          sbUser = session ? mapSbUser(session.user) : null;
+          cloudCache = null;
+          renderAuthUI();
+        });
+        const { data } = await sb.auth.getSession();
+        if (data && data.session) sbUser = mapSbUser(data.session.user);
+        renderAuthUI();
+        return sb;
+      } catch (e) {
+        console.warn('[cloud] 初始化失败：', e);
+        toast('云端服务连接失败，已切回本地存储', 'warn');
+        return null;
+      }
+    })();
+  }
+  return sbInitPromise;
+}
+
+function mapSbUser(u) {
+  if (!u) return null;
+  const meta = u.user_metadata || {};
+  return { id: u.id, username: meta.username || (u.email || '').split('@')[0] || '用户' };
+}
+
+function usernameToEmail(name) { return name.toLowerCase() + '@' + SB.EMAIL_DOMAIN; }
+
+/* ---------- 14.2 账号界面 ---------- */
+let authMode = 'signin';
+
+const AUTH_COPY = {
+  signin: {
+    title: '登录账号',
+    sub: '登录后作品会存到云端，换一台电脑登录同一个账号，画廊里还是这些画。',
+    submit: '登录', switchText: '还没有账号？', switchBtn: '立即注册'
+  },
+  signup: {
+    title: '注册新账号',
+    sub: '用户名只用于登录，不会公开。你画的每一张作品都只属于这个账号。',
+    submit: '创建账号', switchText: '已经有账号了？', switchBtn: '去登录'
+  }
+};
+
+function renderAuthUI() {
+  const btn = $('btnAuth'), box = $('userBox'), nm = $('userName');
+  if (!btn || !box) return;
+  btn.classList.toggle('show', cloudEnabled() && !cloudMode());
+  box.classList.toggle('show', cloudEnabled() && cloudMode());
+  if (cloudMode() && nm) nm.textContent = sbUser.username;
+}
+
+function openAuth(mode) {
+  if (!cloudEnabled()) {
+    toast('云端还没配置，作品目前只存在本机', 'warn');
+    return;
+  }
+  authMode = mode === 'signup' ? 'signup' : 'signin';
+  const c = AUTH_COPY[authMode];
+  $('authTitle').textContent = c.title;
+  $('authSub').textContent = c.sub;
+  $('authSubmit').textContent = c.submit;
+  $('authSwitchText').textContent = c.switchText;
+  $('authSwitchBtn').textContent = c.switchBtn;
+  $('authError').classList.remove('show');
+  $('authPass').value = '';
+  $('authModal').classList.add('show');
+  setTimeout(() => { try { $('authUser').focus(); } catch (e) {} }, 60);
+}
+
+function closeAuth() { $('authModal').classList.remove('show'); }
+
+function authFail(msg) {
+  const el = $('authError');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+
+function friendlyAuthError(e) {
+  const m = (e && e.message) || '';
+  if (/Invalid login credentials/i.test(m)) return '用户名或密码不对，注意大小写';
+  if (/already registered|already been registered|already exists/i.test(m)) return '这个用户名已经被注册了，换一个，或者直接登录';
+  if (/Password should be at least/i.test(m)) return '密码太短了，至少 6 位';
+  if (/Email not confirmed|not confirmed/i.test(m)) return '账号还没通过邮箱验证。到 Supabase 的 SQL Editor 里重新执行一次 supabase_setup.sql（里面会自动确认邮箱），再登录';
+  if (/rate limit|too many|For security purposes/i.test(m)) return '操作太频繁，等一分钟再试';
+  if (/Failed to fetch|NetworkError|fetch failed/i.test(m)) return '连不上服务器，检查一下网络';
+  return m || '操作失败，请稍后重试';
+}
+
+async function submitAuth() {
+  if (!cloudEnabled()) return;
+  if (!sb) await initCloud();
+  if (!sb) { authFail('云端客户端没初始化成功，刷新页面再试'); return; }
+
+  const name = ($('authUser').value || '').trim();
+  const pass = $('authPass').value || '';
+  if (!/^[A-Za-z0-9_]{2,20}$/.test(name)) { authFail('用户名只能是 2–20 位字母、数字或下划线（中文暂不支持）'); return; }
+  if (pass.length < 6) { authFail('密码至少 6 位'); return; }
+
+  $('authModal').classList.add('busy');
+  try {
+    if (authMode === 'signup') {
+      const email = usernameToEmail(name);
+      const { data, error } = await sb.auth.signUp({
+        email: email,
+        password: pass,
+        options: { data: { username: name } }
+      });
+      if (error) throw error;
+      if (!data.session) {
+        // 项目开着「Confirm email」时 signUp 不返回会话。
+        // 如果数据库端装了自动确认触发器，账号其实已经可用，这里补一次密码登录。
+        const retry = await sb.auth.signInWithPassword({ email: email, password: pass });
+        if (retry.error || !retry.data || !retry.data.session) {
+          throw new Error('账号已创建，但还没通过邮箱验证。请到 Supabase 后台关闭 "Confirm email"，或在 SQL Editor 里执行 supabase_setup.sql 开启自动确认');
+        }
+      }
+      closeAuth();
+      toast('账号已创建，欢迎 ' + name);
+    } else {
+      const { data, error } = await sb.auth.signInWithPassword({ email: usernameToEmail(name), password: pass });
+      if (error) throw error;
+      closeAuth();
+      toast('欢迎回来，' + ((data.user && data.user.user_metadata && data.user.user_metadata.username) || name));
+    }
+    await afterLogin();
+  } catch (e) {
+    authFail(friendlyAuthError(e));
+  } finally {
+    $('authModal').classList.remove('busy');
+  }
+}
+
+async function signOut() {
+  if (!sb) return;
+  try { await sb.auth.signOut(); } catch (e) { /* 忽略 */ }
+  sbUser = null;
+  cloudCache = null;
+  renderAuthUI();
+  toast('已退出，作品仍在云端，下次登录可见');
+  await refreshGalleryUI();
+}
+
+/** 登录成功后的收尾：把本机遗留作品迁到云端，然后刷新界面 */
+async function afterLogin() {
+  await migrateLocalToCloud();
+  await refreshGalleryUI();
+}
+
+async function migrateLocalToCloud() {
+  if (!cloudMode()) return;
+  const local = readLocal();
+  if (!local.length) return;
+  toast('正在把本机 ' + local.length + ' 件作品同步到云端…');
+  let ok = 0;
+  for (const it of local) {
+    const copy = Object.assign({}, it, {
+      id: 'g_' + it.ts + '_' + Math.random().toString(36).slice(2, 6)
+    });
+    if (await addArtworkCloud(copy, true)) ok++;
+  }
+  if (ok) { localStorage.removeItem(G.KEY); localCache = []; }
+  toast(ok ? '已同步 ' + ok + ' 件作品到云端' : '本机作品同步失败，之后可以再试', ok ? 'info' : 'err');
+}
+
+/* ---------- 14.3 本地存储（未登录时） ---------- */
+function readLocal() {
+  if (localCache) return localCache;
+  try {
+    const raw = localStorage.getItem(G.KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    localCache = Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    localCache = [];
+    toast('本地画廊数据读取失败，已重置', 'warn');
+  }
+  return localCache;
+}
+
+function persistLocal(list) {
+  let arr = list.slice(0, G.MAX);
+  let dropped = list.length - arr.length;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      localStorage.setItem(G.KEY, JSON.stringify(arr));
+      localCache = arr;
+      return { ok: true, dropped, total: arr.length };
+    } catch (e) {
+      const quota = e && (e.name === 'QuotaExceededError' ||
+                          e.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+                          e.code === 22 || e.code === 1014);
+      if (!quota || arr.length <= 1) return { ok: false, err: e };
+      arr = arr.slice(0, arr.length - 1);
+      dropped++;
+    }
+  }
+  return { ok: false, err: new Error('quota') };
+}
+
+/* ---------- 14.4 统一读取接口 ---------- */
+/** 读全部作品。已登录走云端，否则读本机。 */
+async function listArtworks() {
+  if (cloudEnabled() && !sb) await initCloud();
+  if (cloudMode()) {
+    if (cloudCache) return cloudCache;
+    const { data, error } = await sb.from('artworks')
+      .select('id,title,module,target_id,score,w,h,thumb_url,full_url,bytes,created_at')
+      .order('created_at', { ascending: false });
+    if (error) {
+      toast('云端画廊读取失败：' + error.message, 'err');
+      return cloudCache || [];
+    }
+    cloudCache = (data || []).map(rowToItem);
+    return cloudCache;
+  }
+  return readLocal();
+}
+
+function rowToItem(r) {
+  const d = new Date(r.created_at);
+  return {
+    id: r.id, title: r.title, module: r.module,
+    targetId: r.target_id, score: r.score,
+    ts: d.getTime(), w: r.w, h: r.h,
+    thumb: r.thumb_url, full: r.full_url,
+    bytes: r.bytes || 0,
+    dateText: fmtDateTime(d)
+  };
+}
+
+function fmtDateTime(d) {
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function usageText(list) {
+  if (cloudMode()) return list.length + ' 件作品 · 已同步云端';
+  const mb = list.reduce((s, x) => s + (x.bytes || 0), 0) * 2 / 1048576;  // UTF-16 保守估算
+  const tail = cloudEnabled() ? ' · 仅本机，登录后可跨设备' : ' · 仅本机';
+  return list.length + ' / ' + G.MAX + ' 件 · 约 ' + mb.toFixed(1) + ' MB' + tail;
+}
+
+/* ---------- 14.5 云端上传 ---------- */
+function dataUrlToBlob(dataUrl) {
+  const parts = String(dataUrl).split(',');
+  const mime = (parts[0].match(/:(.*?);/) || [])[1] || 'image/jpeg';
+  const bin = atob(parts[1]);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new Blob([buf], { type: mime });
+}
+
+async function uploadShot(item) {
+  const bucket = sb.storage.from(SB.BUCKET);
+  const base = sbUser.id + '/' + item.id;
+  const put = async (path, dataUrl) => {
+    const { error } = await bucket.upload(path, dataUrlToBlob(dataUrl), {
+      contentType: 'image/jpeg', upsert: true, cacheControl: '31536000'
+    });
+    if (error) throw error;
+    return bucket.getPublicUrl(path).data.publicUrl;
+  };
+  const full = await put(base + '_full.jpg', item.full);
+  const thumb = await put(base + '_thumb.jpg', item.thumb);
+  return { full, thumb };
+}
+
+async function removeShot(id) {
+  try {
+    await sb.storage.from(SB.BUCKET).remove([
+      sbUser.id + '/' + id + '_full.jpg',
+      sbUser.id + '/' + id + '_thumb.jpg'
+    ]);
+  } catch (e) { /* 图片删失败不影响列表一致性，忽略 */ }
+}
+
+/* ---------- 14.6 统一写入接口 ---------- */
+async function addArtwork(item) {
+  if (cloudEnabled() && !sb) await initCloud();
+  return cloudMode() ? addArtworkCloud(item) : addArtworkLocal(item);
+}
+
+function addArtworkLocal(item) {
+  const r = persistLocal([item].concat(readLocal()));
+  if (!r.ok) {
+    toast('本机存储空间不足，保存失败。请到「我的画廊」删掉几张后再试', 'err');
+    return false;
+  }
+  if (r.dropped > 0) toast('空间不足，已自动清理 ' + r.dropped + ' 张最旧作品', 'warn');
+  else toast('已保存到我的画廊（仅本机）');
+  return true;
+}
+
+async function addArtworkCloud(item, silent) {
+  if (!silent) toast('正在上传到云端…');
+  try {
+    const urls = await uploadShot(item);
+    const { error } = await sb.from('artworks').insert({
+      id: item.id,
+      title: item.title,
+      module: item.module,
+      target_id: item.targetId || null,
+      score: (item.score == null ? null : item.score),
+      w: item.w, h: item.h,
+      thumb_url: urls.thumb,
+      full_url: urls.full,
+      bytes: item.bytes || 0
+    });
+    if (error) { await removeShot(item.id); throw error; }
+    cloudCache = null;
+    if (!silent) toast('已保存到云端画廊');
+    return true;
+  } catch (e) {
+    if (!silent) toast('上传失败：' + ((e && e.message) || '网络异常'), 'err');
+    return false;
+  }
+}
+
+async function deleteArtwork(id) {
+  if (cloudEnabled() && !sb) await initCloud();
+  if (cloudMode()) {
+    const { error } = await sb.from('artworks').delete().eq('id', id);
+    if (error) { toast('删除失败：' + error.message, 'err'); return false; }
+    await removeShot(id);
+    cloudCache = null;
+    toast('已删除');
+    return true;
+  }
+  const r = persistLocal(readLocal().filter(x => x.id !== id));
+  if (!r.ok) { toast('删除失败：存储异常', 'err'); return false; }
+  toast('已删除');
+  return true;
+}
+
+async function clearArtworks() {
+  if (cloudEnabled() && !sb) await initCloud();
+  if (cloudMode()) {
+    if (!cloudCache) await listArtworks();   // 先确保手上有完整列表，否则 Storage 里的图删不干净
+    const ids = (cloudCache || []).map(x => x.id);
+    const { error } = await sb.from('artworks').delete().eq('user_id', sbUser.id);
+    if (error) { toast('清空失败：' + error.message, 'err'); return false; }
+    if (ids.length) {
+      const paths = [];
+      ids.forEach(i => paths.push(sbUser.id + '/' + i + '_full.jpg', sbUser.id + '/' + i + '_thumb.jpg'));
+      try { await sb.storage.from(SB.BUCKET).remove(paths); } catch (e) { /* 忽略 */ }
+    }
+    cloudCache = [];
+    return true;
+  }
+  localStorage.removeItem(G.KEY);
+  localCache = [];
+  return true;
+}
+
+/** 界面统一刷新入口 */
+async function refreshGalleryUI() {
+  await renderGallery();
+  await renderHomePreview();
+}
+
+function badgeLevel(s) { return s >= 85 ? 'high' : s >= 60 ? 'mid' : 'low'; }
+
+async function renderGallery() {
+  const list = await listArtworks();
+  const grid = $('galGrid'), empty = $('galEmpty');
+  grid.innerHTML = '';
+  empty.classList.toggle('show', list.length === 0);
+  $('galUsage').textContent = usageText(list);
+
+  const frag = document.createDocumentFragment();
+  list.forEach((it, i) => {
+    const card = document.createElement('figure');
+    card.className = 'gal-item';
+    card.innerHTML =
+      '<div class="gal-thumb"><img alt="作品缩略图" loading="lazy"></div>' +
+      '<figcaption><span class="gal-title"></span><span class="gal-meta"></span></figcaption>' +
+      (it.score != null ? '<span class="gal-badge" data-lv="' + badgeLevel(it.score) + '">' + it.score + '</span>' : '');
+    card.querySelector('img').src = it.thumb;
+    card.querySelector('.gal-title').textContent = it.title;
+    card.querySelector('.gal-meta').textContent =
+      (it.module === 'free' ? '自由画板' : '模仿挑战') + ' · ' + it.dateText;
+    card.onclick = () => openLightbox(i);
+    frag.appendChild(card);
+  });
+  grid.appendChild(frag);
+}
+
+async function renderHomePreview() {
+  const list = await listArtworks();
+  $('galCountText').textContent = list.length ? ('已有 ' + list.length + ' 件作品') : '还没有作品';
+  const img = $('galLatest');
+  if (list.length) { img.src = list[0].thumb; img.style.display = 'block'; }
+  else { img.removeAttribute('src'); img.style.display = 'none'; }
+}
+
+/* ---------- 灯箱 ---------- */
+let lbIndex = 0;
+
+async function openLightbox(i) {
+  lbIndex = i;
+  $('lightbox').classList.add('show');
+  document.body.style.overflow = 'hidden';
+  await updateLightbox();
+}
+
+async function updateLightbox() {
+  const list = await listArtworks();
+  const it = list[lbIndex];
+  if (!it) return closeLightbox();
+  $('lbImg').src = it.full;
+  $('lbTitle').textContent = it.title;
+  $('lbInfo').textContent = it.dateText + (it.score != null ? ' · ' + it.score + ' 分' : '');
+  $('lbCounter').textContent = (lbIndex + 1) + ' / ' + list.length;
+  $('lbPrev').disabled = lbIndex <= 0;
+  $('lbNext').disabled = lbIndex >= list.length - 1;
+  const del = $('lbDelete');
+  del.classList.remove('confirm');
+  del.textContent = '删除';
+}
+
+function closeLightbox() {
+  $('lightbox').classList.remove('show');
+  document.body.style.overflow = '';
+}
+
+async function navLightbox(d) {
+  const list = await listArtworks();
+  const next = lbIndex + d;
+  if (next < 0 || next >= list.length) return;
+  lbIndex = next;
+  await updateLightbox();
+}
+
+/* ============================================================
+ * 模块 15：主流程编排
+ * ============================================================ */
+let hands = null;
+let sendBusy = false;
+let firstResult = true;
 let lastT = performance.now(), fpsEMA = 0;
 
-/** MediaPipe 每帧识别结果回调（真正的"主循环体"） */
 function onResults(results) {
-  const now = performance.now();
+  if (!loop.running) return;                 // 暂停后在途帧直接丢弃
 
-  // --- FPS 统计（指数滑动平均） ---
+  const now = performance.now();
   const dt = now - lastT; lastT = now;
   const f = 1000 / Math.max(dt, 1);
   fpsEMA = fpsEMA ? fpsEMA * 0.9 + f * 0.1 : f;
   fpsEl.textContent = Math.round(fpsEMA) + ' FPS';
 
-  // --- 首帧到达：关闭加载页，进入主界面 ---
   if (firstResult) {
     firstResult = false;
     $('overlay').classList.add('hide');
-    toast('将手伸到镜头前，伸出食指即可开始绘画');
+    showView('home', { force: true });
+    toast('先选一个模块，把手伸到镜头前、伸出食指即可开始');
   }
+
+  // 舞台没显示（首页 / 画廊）时不做任何绘制，避免首帧在画布上留下一个点
+  if (!stageEl.classList.contains('show')) { cursorEl.style.display = 'none'; return; }
 
   const lms = results.multiHandLandmarks;
   const hasHand = lms && lms.length > 0;
 
   if (!hasHand) {
+    endActiveStroke();
     stepStateMachine(null, false, now);
-    state.fistHoldStart = 0; state.fistHoldFired = false; // 手丢失时重置握拳计时，防止回来误触发
+    state.fistHoldStart = 0; state.fistHoldFired = false;
     cursorEl.style.display = 'none';
-    // 丢帧抖动容错：连续约 0.6 秒无手才显示提示，避免闪烁
     if (state.lastHandTime && now - state.lastHandTime > 600) noHandTip.classList.add('show');
     return;
   }
   noHandTip.classList.remove('show');
 
-  const lm = lms[0];                          // 只追踪一只手（性能考虑）
+  const lm = lms[0];
   const gesture = stabilizer.feed(classifyGesture(fingerStates(lm)));
   const drawing = stepStateMachine(gesture, true, now);
 
-  // --- 食指尖端(8号点)坐标：视频做了镜像显示，x 坐标需要取反 ---
+  // 视频做了镜像显示，x 坐标需要取反
   const raw = { x: (1 - lm[8].x) * CONFIG.CANVAS_W, y: lm[8].y * CONFIG.CANVAS_H };
 
   if (drawing) {
     const p = smoother.next(raw.x, raw.y, now);
     if (!draw.active) {
-      smoother.reset();                       // 新笔画从当前点起步，防止从旧位置"飞线"
+      smoother.reset();
       const p0 = smoother.next(raw.x, raw.y, now);
       draw.beginStroke(p0, state.tool === 'eraser');
     } else {
@@ -887,29 +2383,14 @@ function onResults(results) {
     }
     moveCursor(p);
   } else {
-    smoother.reset();                         // 抬笔期间持续重置，恢复落笔时不跳变
+    smoother.reset();
     moveCursor(raw);
   }
   updateCursorStyle();
 
-  // --- 手势离开握拳状态时，重置握拳计时器 ---
   if (gesture !== 'FIST') { state.fistHoldStart = 0; state.fistHoldFired = false; }
 }
 
-/** rAF 主循环：逐帧把视频画面送入识别器 */
-function startLoop() {
-  requestAnimationFrame(async () => {
-    if (!state.running) return;
-    if (!sendBusy && video.readyState >= 2) {
-      sendBusy = true;
-      try { await hands.send({ image: video }); } catch (e) { /* 单帧失败忽略 */ }
-      sendBusy = false;
-    }
-    startLoop();
-  });
-}
-
-/** 显示错误卡片（分类提示） */
 function showError(err) {
   $('startBox').style.display = 'none';
   $('loadingBox').classList.remove('show');
@@ -920,51 +2401,191 @@ function showError(err) {
     (err.message && err.tip ? '\n（技术信息：' + err.message + '）' : '');
 }
 
-/** 启动按钮点击后的完整初始化流程 */
 async function boot() {
   const loading = $('loadingBox');
   try {
     $('startBox').style.display = 'none';
     loading.classList.add('show');
 
-    // 第 1 步：摄像头（此时才申请权限）
     $('loadText').textContent = '正在开启摄像头…';
     $('loadSub').textContent = '如果浏览器弹出权限询问，请选择「允许」';
     await startCamera();
 
-    // 第 2 步：按需加载手部识别库（CDN 多源容错）
     $('loadText').textContent = '正在加载手部追踪模型…';
     $('loadSub').textContent = '首次运行需联网下载约 3 MB，之后有浏览器缓存';
     const base = await loadHandsLibrary();
 
-    // 第 3 步：初始化 MediaPipe Hands
-    hands = new window.Hands({
-      // locateFile：告诉 MediaPipe 到哪个 CDN 找 wasm/模型文件
-      locateFile: f => base + '/' + f
-    });
+    $('loadText').textContent = '正在初始化识别引擎…';
+    hands = new window.Hands({ locateFile: f => base + '/' + f });
     hands.setOptions({
-      maxNumHands: 1,               // 只识别一只手（降低计算量）
-      modelComplexity: 1,           // 0=轻量(快) 1=完整(准)，取平衡
-      minDetectionConfidence: 0.6,  // 检测置信度阈值
-      minTrackingConfidence: 0.5    // 跟踪置信度阈值
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5
     });
     hands.onResults(onResults);
 
-    // 第 4 步：启动主循环（首帧识别成功后 onResults 里自动收起加载页）
-    $('loadText').textContent = '正在初始化识别引擎…';
     state.phase = 'IDLE'; updateBadge();
-    state.running = true;
-    startLoop();
+    loop.start();
   } catch (err) {
     showError(err);
   }
 }
 
-/* ---------- 页面入口 ---------- */
+/* ============================================================
+ * 模块 16：页面入口
+ * 全局键盘：灯箱打开时只响应灯箱；画板里才响应 Ctrl+Z / Ctrl+Y
+ * ============================================================ */
+document.addEventListener('keydown', e => {
+  if ($('authModal').classList.contains('show')) {
+    if (e.key === 'Escape') closeAuth();
+    return;
+  }
+  if ($('lightbox').classList.contains('show')) {
+    if (e.key === 'Escape') closeLightbox();
+    if (e.key === 'ArrowLeft') { e.preventDefault(); navLightbox(-1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); navLightbox(1); }
+    return;
+  }
+  if ($('scoreModal').classList.contains('show')) {
+    if (e.key === 'Escape') closeScoreModal();
+    return;
+  }
+  if (!(e.ctrlKey || e.metaKey)) return;
+  if (curView !== 'free' && curView !== 'challenge') return;
+  if (e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); draw.history.undo(); }
+  if (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z')) { e.preventDefault(); draw.history.redo(); }
+});
+
+/* 视图入口 */
+$('homeHero').addEventListener('click', () => showView('free'));
+$('homeHeroBtn').addEventListener('click', e => { e.stopPropagation(); showView('free'); });
+$('tileChallenge').addEventListener('click', () => showView('challenge'));
+$('tileGallery').addEventListener('click', () => showView('gallery'));
+$('btnBack').addEventListener('click', () => showView('home'));
+$('emptyGoDraw').addEventListener('click', () => showView('free'));
+
+/* 挑战 */
+$('traceToggle').addEventListener('change', e => {
+  stageEl.classList.toggle('tracing', e.target.checked);
+});
+$('scoreClose').addEventListener('click', () => closeScoreModal());
+$('btnScoreSave').addEventListener('click', saveChallengeArtwork);
+$('btnScoreRetry').addEventListener('click', () => {
+  chCtx.clearRect(0, 0, CONFIG.CANVAS_W, CONFIG.CANVAS_H);
+  chEngine.history.reset();
+  closeScoreModal();
+  toast('已清空，重新画一幅吧');
+});
+$('btnScoreNext').addEventListener('click', () => {
+  const i = CHALLENGES.findIndex(c => c.id === curTargetId);
+  const n = CHALLENGES[(i + 1) % CHALLENGES.length];
+  closeScoreModal(false);
+  selectTarget(n.id, true);
+  loop.start();
+});
+
+/* 画廊 */
+$('lbClose').addEventListener('click', closeLightbox);
+$('lbPrev').addEventListener('click', () => navLightbox(-1));
+$('lbNext').addEventListener('click', () => navLightbox(1));
+$('lbDownload').addEventListener('click', async () => {
+  const it = (await listArtworks())[lbIndex];
+  if (!it) return;
+  const name = 'aircanvas_' + it.module + '_' + it.ts + '.jpg';
+  try {
+    if (/^https?:/i.test(it.full)) {
+      // 云端图片是跨域地址，a[download] 会被忽略，必须先 fetch 成 blob
+      const res = await fetch(it.full, { mode: 'cors' });
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    } else {
+      const a = document.createElement('a');
+      a.href = it.full; a.download = name; a.click();
+    }
+    toast('已下载到本地');
+  } catch (e) {
+    window.open(it.full, '_blank');
+    toast('已在新标签打开，右键另存即可', 'warn');
+  }
+});
+$('lbDelete').addEventListener('click', async e => {
+  const btn = e.currentTarget;
+  if (!btn.classList.contains('confirm')) {
+    btn.classList.add('confirm');
+    btn.textContent = '再点一次确认';
+    setTimeout(() => {
+      if (btn.classList.contains('confirm')) { btn.classList.remove('confirm'); btn.textContent = '删除'; }
+    }, 3000);
+    return;
+  }
+  const it = (await listArtworks())[lbIndex];
+  if (!it) return;
+  if (await deleteArtwork(it.id)) {
+    const list = await listArtworks();
+    if (!list.length) { closeLightbox(); await refreshGalleryUI(); return; }
+    lbIndex = Math.min(lbIndex, list.length - 1);
+    await refreshGalleryUI();
+    await updateLightbox();
+  }
+});
+$('btnGalClearAll').addEventListener('click', e => {
+  const btn = e.currentTarget;
+  twoStep(btn, '再点一次确认清空全部作品', async () => {
+    if (await clearArtworks()) {
+      await refreshGalleryUI();
+      toast(cloudMode() ? '云端作品已清空' : '画廊已清空');
+    }
+  }, '再点一次确认');
+});
+
+/* 账号 */
+$('btnAuth').addEventListener('click', () => openAuth('signin'));
+$('btnLogout').addEventListener('click', signOut);
+$('authClose').addEventListener('click', closeAuth);
+$('authCancel').addEventListener('click', closeAuth);
+$('authSubmit').addEventListener('click', submitAuth);
+$('authSwitchBtn').addEventListener('click', () => {
+  authMode = authMode === 'signin' ? 'signup' : 'signin';
+  const c = AUTH_COPY[authMode];
+  $('authTitle').textContent = c.title;
+  $('authSub').textContent = c.sub;
+  $('authSubmit').textContent = c.submit;
+  $('authSwitchText').textContent = c.switchText;
+  $('authSwitchBtn').textContent = c.switchBtn;
+  $('authError').classList.remove('show');
+});
+$('authModal').addEventListener('click', e => { if (e.target === $('authModal')) closeAuth(); });
+['authUser', 'authPass'].forEach(id => {
+  $(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); submitAuth(); }
+  });
+});
+
+/* 启动 / 重试 */
 $('startBtn').addEventListener('click', boot);
 $('retryBtn').addEventListener('click', () => location.reload());
-initToolbar();
+
+/* 初始化 */
+createToolbar($('toolbarFree'), {});
+createToolbar($('toolbarCh'), { extra: 'challenge' });
+uiReady = true;
+ensureChallenge();
+syncToolbars();
 updateBadge();
+renderAuthUI();
+if (cloudEnabled()) initCloud();   // 配了 Supabase 才连，没配就纯本地
+renderHomePreview();
+showView('home', { force: true });
+
+/* 舞台吸附：窗口/布局变化都要重算（比只监听 resize 可靠） */
+if (window.ResizeObserver) new ResizeObserver(() => syncStageToSlot()).observe(viewsEl);
+window.addEventListener('resize', syncStageToSlot);
+window.addEventListener('orientationchange', () => setTimeout(syncStageToSlot, 150));
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(syncStageToSlot);
 </script>
 </body>
 </html>
